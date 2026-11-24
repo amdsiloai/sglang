@@ -1139,6 +1139,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1171,6 +1174,12 @@ class Envs:
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
     SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    # Quark MXFP4 MoE on gfx95: call aiter.fused_moe with stage2_fp8=True in every MoE
+    # layer except a speculative draft's. AITER then writes FP8 per-route outputs and sums
+    # them in fp32 where the tuned stage 2 allows it (a FlyDSL reduce, or an MXFP4 scatter
+    # after an MXMOE stage 1); not bitwise equal to the default. Needs an AITER whose
+    # fused_moe takes stage2_fp8. AITER_FLYDSL_STAGE2_FP8=1 applies to the draft as well.
+    SGLANG_AITER_MOE_STAGE2_FP8 = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1234,6 +1243,10 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # gfx950 only: the gated hyper-connection mix and combine of more than 48 rows
+    # run as Triton kernels (the down projection a split-K kernel up to 512 rows, torch.bmm
+    # above) without the normed residual.
+    SGLANG_USE_HIP_HC_PREFILL_TRITON = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -1778,6 +1791,11 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
+    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
+    # QuickReduce (and its codec, such as INT4) from the measured message size.
+    # Unset keeps the built-in order.
+    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
