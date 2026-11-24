@@ -680,6 +680,11 @@ class Envs:
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Attention (aiter, ROCm): when unified verify is active, drop the host
+    # seq_lens mirror (needs_cpu_seq_lens=False) so spec-v2 overlap resolves
+    # lengths stream-ordered on the GPU instead of syncing the host every step.
+    # Unified verify sizes from its page table and max_context_len. Default off.
+    SGLANG_AITER_SYNC_FREE_VERIFY = EnvBool(False)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
@@ -1139,6 +1144,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1778,6 +1786,11 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
+    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
+    # QuickReduce (and its codec, such as INT4) from the measured message size.
+    # Unset keeps the built-in order.
+    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
