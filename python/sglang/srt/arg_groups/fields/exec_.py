@@ -335,7 +335,7 @@ class ExecKernel(msgspec.Struct):
     fp4_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
+            help="Choose the runner backend for FP4 GEMM operations (NVFP4 on CUDA, Quark MXFP4 dense linear on ROCm). Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, triton on ROCm, flashinfer_cutlass otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+), 'aiter' (ROCm gfx95 only; AITER CK/ASM MXFP4 GEMM with preshuffled weights, uses AITER's tuned a4w4 GEMM configs), 'triton' (ROCm only; AITER Triton MXFP4 GEMM fallback). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -1109,6 +1109,10 @@ class ExecMoe(msgspec.Struct):
     enable_waterfill: A[
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+    ] = False
+    enable_aiter_mega_moe_tp: A[
+        bool,
+        "Run the eager extend forwards (up to SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS tokens, default 4096) of a GLM-5-Next model (Glm5NextForConditionalGeneration, e.g. GLM-5.3-Flash) as one AITER MegaMoE-TP kernel that fuses the routed experts, the shared expert and the TP all-reduce. Any other model is refused at load. Needs MXFP4 experts on the AITER MoE runner, ROCm gfx950 and TP 2-8 on one node. Decode, CUDA graphs and torch.compile keep the stock MoE path; online weight updates are not supported.",
     ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],

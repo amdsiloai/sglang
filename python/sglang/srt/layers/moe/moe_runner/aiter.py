@@ -167,6 +167,13 @@ def _aiter_fused_moe_supports_output() -> bool:
     return "output" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_stage2_fp8() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "stage2_fp8" in inspect.signature(fused_moe).parameters
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -602,11 +609,15 @@ def _pre_permute_deepep_to_aiter(
         is_w4a4 = weight_quant == AiterQuantType.PER_1X32
         is_fp4_dispatch = hidden_states.dtype == torch.float4_e2m1fn_x2
 
-        # AITER fused_moe Clamped-SwiGLU is dispatched with
-        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
-        # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
-        swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
-            "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
+        # INTERLEAVE makes AITER consume bf16/fp8 activations instead of the
+        # packed FP4 payload, including unclamped models whose quant method
+        # supplies the effective gate mode explicitly.
+        gate_mode = (quant_info.fused_moe_kwargs or {}).get("gate_mode")
+        swiglu_interleave = (
+            str(getattr(gate_mode, "value", gate_mode)).lower() == "interleave"
+            if gate_mode is not None
+            else quant_info.swiglu_limit > 0
+            and get_bool_env_var("SGLANG_USE_AITER_MOE_GU_ITLV", "true")
         )
 
         # MXFP8 dispatch already carries fp8 data with group-32 e8m0 scales,

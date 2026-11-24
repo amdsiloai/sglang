@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
@@ -55,7 +56,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import post_experts_output_is_complete
+from sglang.srt.layers.moe import aiter_mega_moe_tp, post_experts_output_is_complete
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -119,8 +120,10 @@ from sglang.srt.models.glm_ocr import (
 )
 from sglang.srt.models.utils import WeightsMapper, bind_or_assign
 from sglang.srt.multimodal.mm_utils import (
+    hip_dp_encoder_batches_vit,
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
+    warm_up_vision_tower,
 )
 from sglang.srt.runtime_context import (
     get_forward,
@@ -835,6 +838,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 reduce_results=False,
             )
+            aiter_mega_moe_tp.register(self.mlp)
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Glm5NextMLP(
@@ -978,7 +982,12 @@ class Glm5NextDecoderLayer(nn.Module):
         # still launches separately, so this is two launches instead of three.
         assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
         num_tokens, hidden_size = hidden_states.shape
-        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
+        # The fused boundary is used only up to a token count, so in batch-invariant
+        # mode a token's kernels would follow its batch size.
+        if (
+            num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS
+            or is_batch_invariant_mode_enabled()
+        ):
             return None
         hc_mult = self.config.hc_mult
         fused = apply_mhc_post_pre_boundary(
@@ -1069,6 +1078,17 @@ class Glm5NextDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
+        if isinstance(self.mlp, Glm5NextMoE):
+            reduced = aiter_mega_moe_tp.maybe_forward(
+                self.mlp, hidden_states, forward_batch, gemm_output_zero_allocator
+            )
+            if reduced is not None:
+                # One kernel ran the routed and shared experts and the TP all-reduce.
+                hidden_states = self.ffn_boundary.complete_now(
+                    reduced, forward_batch, already_reduced=True
+                )
+                return (hidden_states, topk_indices)
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
@@ -1573,10 +1593,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 )
             parallel = get_parallel()
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in (2, 4, 8)
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return (
+                    "HIP shared experts fusion is validated only for TP2, TP4 and TP8."
+                )
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096
@@ -1736,6 +1758,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model.dflash_capture = True
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def precompile_kernels_after_loading(self) -> None:
+        # Under the batched DP encoder every rank's first ViT call would otherwise
+        # compile swiglu_clamped inside the first image burst. The first grid
+        # compiles its 3-D (blocks) and 2-D (merger) calls; the second grid's new
+        # size recompiles the 3-D call with a dynamic shape.
+        if self.visual is not None and hip_dp_encoder_batches_vit():
+            warm_up_vision_tower(self.visual, ([[1, 32, 32]], [[1, 48, 64]]))
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
