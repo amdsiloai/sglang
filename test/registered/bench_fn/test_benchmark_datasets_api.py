@@ -42,6 +42,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
 )
 from sglang.benchmark.datasets.image import (
     ImageDataset,
+    get_image_token_id,
     parse_random_image_resolution,
     sample_image_requests,
 )
@@ -603,6 +604,37 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
+
+    def test_image_sampler_excludes_image_token_id_from_text(self):
+        image_token_id = 100
+        rows = sample_image_requests(
+            num_requests=4,
+            image_count=1,
+            input_len=4000,
+            output_len=4,
+            range_ratio=1.0,
+            processor=self.processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="sglang-oai-chat",
+            random_image_count=False,
+            image_token_id=image_token_id,
+        )
+        for row in rows:
+            ids = self.tokenizer.encode(row.prompt, add_special_tokens=False)
+            self.assertNotIn(image_token_id, ids)
+
+    def test_get_image_token_id_reads_config_for_bare_tokenizer(self):
+        with patch(
+            "sglang.benchmark.datasets.image.AutoConfig.from_pretrained",
+            return_value=SimpleNamespace(image_token_id=7),
+        ) as from_pretrained:
+            # A checkpoint without a multimodal processor loads as a bare tokenizer.
+            self.assertEqual(get_image_token_id(self.tokenizer, "test-model"), 7)
+            # A real processor keeps its own (here unset) image token id.
+            self.assertIsNone(get_image_token_id(self.processor, "test-model"))
+        from_pretrained.assert_called_once_with("test-model", trust_remote_code=True)
 
     def test_image_sampler_chat_backends_use_raw_prompt(self):
         for backend in ("sglang-oai-chat", "vllm-chat", "lmdeploy-chat"):
@@ -1564,6 +1596,147 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "Traceback",
         ]:
             self.assertNotIn(forbidden, stderr)
+
+
+class TestDatasetSpecificResultArgs(unittest.TestCase):
+    """`_dataset_specific_args` should only surface args for the active dataset."""
+
+    def _args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            dataset_name=dataset_name,
+            sharegpt_output_len=None,
+            random_input_len=1024,
+            random_output_len=1024,
+            random_range_ratio=0.0,
+            gsp_num_groups=64,
+            gsp_prompts_per_group=16,
+            gsp_system_prompt_len=2048,
+            gsp_question_len=128,
+            gsp_output_len=256,
+            gsp_range_ratio=1.0,
+            gsp_group_distribution="uniform",
+            gsp_zipf_alpha=None,
+        )
+
+    def _partial_args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(dataset_name=dataset_name)
+
+    def test_random_dataset_omits_gsp_and_sharegpt(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": 1024,
+                "random_output_len": 1024,
+                "random_range_ratio": 0.0,
+            },
+        )
+
+    def test_mmmu_dataset_reports_only_output_len(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("mmmu"))
+        self.assertEqual(result, {"random_output_len": 1024})
+
+    def test_gsp_dataset_omits_random_and_sharegpt(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("generated-shared-prefix"))
+        self.assertNotIn("random_input_len", result)
+        self.assertNotIn("sharegpt_output_len", result)
+        self.assertEqual(result["gsp_system_prompt_len"], 2048)
+        self.assertEqual(result["gsp_output_len"], 256)
+        self.assertEqual(result["gsp_group_distribution"], "uniform")
+        self.assertIsNone(result["gsp_zipf_alpha"])
+
+    def test_sharegpt_like_datasets_report_only_sharegpt_output_len(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in (
+            "agentic-trace",
+            "sharegpt",
+            "custom",
+            "autobench",
+            "openai",
+            "longbench_v2",
+        ):
+            result = _dataset_specific_args(self._args(dataset_name))
+            self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
+
+    def test_agentic_trace_reports_sharegpt_output_len_override(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        args = self._args("agentic-trace")
+        args.sharegpt_output_len = 64
+        self.assertEqual(_dataset_specific_args(args), {"sharegpt_output_len": 64})
+
+    def test_every_registered_dataset_is_classified(self):
+        """A new dataset must get result keys or join the deliberate exceptions."""
+        from sglang.benchmark.datasets import DATASET_MAPPING, DATASET_RESULT_ARG_KEYS
+
+        unlisted = set(DATASET_MAPPING) - set(DATASET_RESULT_ARG_KEYS)
+        self.assertEqual(unlisted, {"mooncake", "speed-bench"})
+
+    def test_other_dataset_returns_empty(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in ("mooncake", "speed-bench"):
+            self.assertEqual(
+                _dataset_specific_args(self._args(dataset_name)), {}, dataset_name
+            )
+
+    def test_manual_random_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": None,
+                "random_output_len": None,
+                "random_range_ratio": None,
+            },
+        )
+
+    def test_manual_mmmu_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("mmmu"))
+        self.assertEqual(result, {"random_output_len": None})
+
+    def test_manual_gsp_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("generated-shared-prefix"))
+        self.assertEqual(
+            result,
+            {
+                "gsp_num_groups": None,
+                "gsp_prompts_per_group": None,
+                "gsp_system_prompt_len": None,
+                "gsp_question_len": None,
+                "gsp_output_len": None,
+                "gsp_range_ratio": None,
+                "gsp_group_distribution": None,
+                "gsp_zipf_alpha": None,
+            },
+        )
+
+    def test_manual_sharegpt_like_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in (
+            "agentic-trace",
+            "sharegpt",
+            "custom",
+            "autobench",
+            "openai",
+            "longbench_v2",
+        ):
+            result = _dataset_specific_args(self._partial_args(dataset_name))
+            self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
 
 
 if __name__ == "__main__":

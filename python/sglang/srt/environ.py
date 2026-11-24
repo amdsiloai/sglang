@@ -294,6 +294,10 @@ class Envs:
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
     # Kimi K3.1 GB300 runtime optimizations; explicitly set children win.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION = EnvBool(False)
+    # Target verify keeps its logits on the vocabulary shards (sharded_verify.py)
+    # without the rest of the runtime master above. A verify consumer still opts
+    # in: EAGLE on CUDA, and DSpark only under this switch.
+    SGLANG_ENABLE_SHARDED_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -1139,6 +1143,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1484,6 +1491,11 @@ class Envs:
     # Triton and Torch compilation
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    # Triton decode attention: each request takes cdiv(kv_len, N) KV splits, bounded by
+    # one wave of programs per batch and SGLANG_TRITON_DECODE_SPLIT_MAX splits (0 keeps
+    # the default heuristic).
+    SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS = EnvInt(0)
+    SGLANG_TRITON_DECODE_SPLIT_MAX = EnvInt(64)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
     # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
     # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
@@ -1778,6 +1790,11 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
+    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
+    # QuickReduce (and its codec, such as INT4) from the measured message size.
+    # Unset keeps the built-in order.
+    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
@@ -2174,6 +2191,9 @@ class Envs:
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # HIP eager prefill, TP > 1, whole hash columns per rank: all-gather each rank's
+    # own fp8 rows instead of all-reducing zero-filled bf16 rows (bitwise the same).
+    SGLANG_OPT_HIP_ENGRAM_ALL_GATHER = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -2214,6 +2234,11 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # With the above: gather the chunk's rows as fp8 (unit scale, RoPE cast to fp8 for
+    # P*V) plus their bf16 RoPE for QK^T, instead of the bf16 dequant, and attend with
+    # aiter's fp8 OPUS kernel. Applies to the V4 cache layout and at most 32 local
+    # heads; other layers keep bf16.
+    SGLANG_OPT_HIP_OPUS_FP8_PREFILL = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
@@ -2350,6 +2375,11 @@ class Envs:
     # Decode and MTP verify attention all-reduce through the push all-reduce
     # (rank-order FP32 sum) instead of the multimem one-shot.
     SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
+    # Inkling2 on ROCm keeps exact all-reduces; the image's quantized quick reduce
+    # (ROCM_QUICK_REDUCE_QUANTIZATION) applies only with this set.
+    SGLANG_INKLING2_ALLOW_QUICK_REDUCE = EnvBool(False)
+    # Inkling2 on ROCm is validated on gfx950 only; this lets other ROCm GPUs try it.
+    SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM = EnvBool(False)
     # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
     # the FP32 token sums.
     SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
