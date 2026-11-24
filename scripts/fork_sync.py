@@ -671,6 +671,7 @@ def main():
     ctx = {"deps": deps, "drafts": sorted(n for n in drafts if n not in stack_bases), "held": sorted(held)}
     write_report(results, contained, multi, unpushed, removed, upstream, today, titles, ctx)
     write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps)
+    git("checkout", "--force", "--detach", fork_main)
 
 
 if __name__ == "__main__":
