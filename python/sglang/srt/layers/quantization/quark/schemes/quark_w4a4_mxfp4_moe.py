@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
@@ -119,8 +120,21 @@ OCP_MX_BLOCK_SIZE = 32
 _arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] if _is_hip else ""
 # gfx120, not gfx12: gfx1250 (MI455) also starts with gfx12 and must stay on AITER.
 _is_consumer_rdna = _arch.startswith(("gfx11", "gfx120"))
-_use_triton_w4a16 = _is_consumer_rdna
+# gfx942 (CDNA3) has no FP4 MoE kernel (FP4 instances are gfx950-only), so it
+# runs the MXFP4 MoE through the same W4A16 upcast path as consumer RDNA.
+_use_triton_w4a16 = _is_consumer_rdna or _arch == "gfx942"
 _TRITON_W4A16_NUM_WARPS = 8
+
+
+def _clamped_swiglu_oai(
+    gate_up: torch.Tensor, intermediate_size: int, alpha: float, limit: float
+) -> torch.Tensor:
+    """Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3) over split gate/up halves.
+    Mirrors aiter.fused_moe.swiglu(); assumes gemm1_beta == 1."""
+    gate_up = gate_up.view(-1, 2 * intermediate_size)
+    gate = gate_up[..., :intermediate_size].clamp(max=limit)
+    up = gate_up[..., intermediate_size:].clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(alpha * gate) * (up + 1)
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -1037,6 +1051,26 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 )
             return
 
+        # Deterministic mode runs SwiGLU and gated SiLU experts through AITER's
+        # deterministic fused_moe, which takes gate/up-interleaved weights.
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            aiter_deterministic_moe_covers,
+        )
+
+        if (
+            _is_shuffle_moe_mxfp4
+            and not _is_gfx1250
+            and get_exec().deterministic.enable_deterministic_inference
+            and aiter_deterministic_moe_covers(layer.moe_runner_config)
+        ):
+            self._shuffle_gu_interleaved(layer)
+            layer.w13_gu_interleaved = True
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                )
+            return
+
         # Pre-shuffle weight scales
         if _is_gfx1250:
             # gfx1250 grouped MoE GEMM consumes B-scales in the n32k4 layout.
@@ -1162,10 +1196,25 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             from aiter.ops.flydsl.moe_common import GateMode
 
             # Quark checkpoints store gate and up projections as separate
-            # contiguous row ranges. Keep that ordering for correctness.
-            _fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
+            # contiguous row ranges. Keep that ordering for correctness, unless the
+            # weights were preshuffled GU-interleaved (deterministic mode).
+            _fused_moe_kwargs = {
+                "gate_mode": (
+                    GateMode.INTERLEAVE.value
+                    if getattr(layer, "w13_gu_interleaved", False)
+                    else GateMode.SEPARATED.value
+                )
+            }
         else:
             _fused_moe_kwargs = None
+
+        swiglu_oai_limit = aiter_swiglu_oai_limit(self.moe_runner_config)
+        # The pad rows are zero-filled, so computing them is exact; declaring them
+        # makes AITER's CK-Tile SwiGLU-OAI stage 1 wrong on the separated gate/up
+        # layout (ROCm/aiter#3862).
+        intermediate_pad = (
+            0 if swiglu_oai_limit is not None else getattr(layer, "intermediate_pad", 0)
+        )
 
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
@@ -1175,11 +1224,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
             hidden_pad=getattr(layer, "hidden_pad", 0),
-            intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            intermediate_pad=intermediate_pad,
             swiglu_limit=(
-                aiter_swiglu_oai_limit(self.moe_runner_config)
-                or self.moe_runner_config.swiglu_limit
-                or 0.0
+                swiglu_oai_limit or self.moe_runner_config.swiglu_limit or 0.0
             ),
             fused_moe_kwargs=_fused_moe_kwargs,
         )
@@ -1194,23 +1241,37 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
-        # silu_and_mul below is plain SwiGLU on split gate/up halves; the clamped /
-        # alpha-scaled variants (e.g. gpt-oss, DeepSeek-V4) would be silently wrong.
         cfg = self.moe_runner_config
-        unsupported = {
-            name: value
-            for name, value in (
-                ("gemm1_alpha", cfg.gemm1_alpha),
-                ("gemm1_beta", cfg.gemm1_beta),
-                ("gemm1_clamp_limit", cfg.gemm1_clamp_limit),
-                ("swiglu_limit", cfg.swiglu_limit or None),
-            )
-            if value is not None
-        }
-        if unsupported:
+        if cfg.gemm1_beta not in (None, 1, 1.0):
             raise NotImplementedError(
-                f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
+                f"W4A16 triton path supports gemm1_beta=1, got {cfg.gemm1_beta}"
             )
+        # The W4A16 fallback consumes StandardDispatchOutput (it needs
+        # topk_output). An all-to-all backend such as DeepEP dispatches a
+        # different result with no topk_output and would fail in the forward,
+        # so reject it here, at load, instead of mid-forward.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if not get_moe_a2a_backend().is_none():
+            raise NotImplementedError(
+                "Quark MXFP4 W4A16 MoE fallback only supports standard dispatch; "
+                "an all-to-all MoE backend (e.g. DeepEP) has no topk_output. "
+                "Disable --moe-a2a-backend for this path."
+            )
+        # Resolve the activation once, here, so the eager forward does no per-call
+        # work. The clamped SwiGLU-OAI (up + 1) bias is correct only for the
+        # OpenAI variant, which sets gemm1_alpha; a clamp configured without an
+        # alpha is a different mode and is not supported (it would wrongly apply
+        # the +1 bias, e.g. gate=1, up=0 -> ~0.846 instead of 0).
+        clamp_limit = float(cfg.gemm1_clamp_limit or cfg.swiglu_limit or 0.0)
+        alpha = cfg.gemm1_alpha
+        if clamp_limit and alpha is None:
+            raise NotImplementedError(
+                "W4A16 clamped MoE supports only the SwiGLU-OAI variant "
+                "(gemm1_alpha set); got a clamp with no alpha."
+            )
+        self._w4a16_clamp_limit = clamp_limit
+        self._w4a16_alpha = float(alpha) if alpha is not None else None
         logger.info_once(
             "Quark MXFP4 MoE on consumer RDNA: no FP4 hardware, running the W4A4 MXFP4 "
             "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
@@ -1255,6 +1316,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         num_tokens, top_k = topk_ids.shape
 
+        if num_tokens == 0:
+            # Idle rank (e.g. attention-DP): with no tokens the final
+            # view(num_tokens, top_k, -1) cannot infer the hidden dim. Return the
+            # empty combine input before the grouped GEMMs. x is (0, hidden_size).
+            return StandardCombineInput(hidden_states=x)
+
         # Expert-major routing for triton_kernels: row i of the grouped GEMM is flat
         # slot combine[i] (= token * top_k + j), sorted by expert id. Everything
         # stays on device (no bincount) so this is CUDA-graph capturable.
@@ -1278,10 +1345,20 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             gather_indx=gather,
             precision_config=self.w13_precision_config,
         )
-        act = torch.empty(
-            (gate_up.shape[0], self.intermediate_size), dtype=x.dtype, device=x.device
-        )
-        silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
+        if self._w4a16_clamp_limit:
+            act = _clamped_swiglu_oai(
+                gate_up,
+                self.intermediate_size,
+                self._w4a16_alpha,
+                self._w4a16_clamp_limit,
+            ).to(x.dtype)
+        else:
+            act = torch.empty(
+                (gate_up.shape[0], self.intermediate_size),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
         out = matmul(
             act,
             self.w2_triton_weight,
