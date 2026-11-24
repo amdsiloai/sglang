@@ -1943,6 +1943,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_MOE_STAGE2_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quark MXFP4 MoE on gfx95: call AITER's <code>fused_moe</code> with <code>stage2_fp8=True</code> in every MoE layer except a speculative draft's. AITER then writes FP8 per-route outputs and sums them in fp32 where the tuned stage 2 allows it (a FlyDSL reduce, or an MXFP4 scatter after an MXMOE stage 1). Not bitwise equal to the default. Needs an AITER whose <code>fused_moe</code> takes <code>stage2_fp8</code>; AITER's <code>AITER_FLYDSL_STAGE2_FP8=1</code> also changes the draft.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_FUSE_RMSNORM_PAD</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the residual-add + RMSNorm + zero-pad triplet before the MoE block via the AITER Triton kernel (TP=1, post-attention layernorm path only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1990,6 +1995,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Rotate each 32-wide block of the input dimension of the <code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code> projections by the orthonormal 32-point Hadamard matrix before MXFP4: the weight once at load, the activation inside the AITER MXFP4 quant. The product does not change, and the quantization error is lower. Needs AITER with <code>hadamard_rotate</code> on <code>per_1x32_f4_quant_hip</code> (ROCm/aiter#6734). Set to <code>0</code> for plain MXFP4.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>

@@ -1139,6 +1139,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1171,6 +1174,12 @@ class Envs:
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
     SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    # Quark MXFP4 MoE on gfx95: call aiter.fused_moe with stage2_fp8=True in every MoE
+    # layer except a speculative draft's. AITER then writes FP8 per-route outputs and sums
+    # them in fp32 where the tuned stage 2 allows it (a FlyDSL reduce, or an MXFP4 scatter
+    # after an MXMOE stage 1); not bitwise equal to the default. Needs an AITER whose
+    # fused_moe takes stage2_fp8. AITER_FLYDSL_STAGE2_FP8=1 applies to the draft as well.
+    SGLANG_AITER_MOE_STAGE2_FP8 = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone
@@ -1223,8 +1232,8 @@ class Envs:
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
-    # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
-    # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
+    # Deprecated: use --fp4-gemm-backend aiter|triton. Honored with a
+    # DeprecationWarning only while --fp4-gemm-backend is auto (see fp4_utils).
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
@@ -1234,6 +1243,9 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Rotate those projections by a 32-wide block Hadamard matrix before MXFP4.
+    # Needs hadamard_rotate on per_1x32_f4_quant_hip (ROCm/aiter#6734).
+    SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD = EnvBool(True)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -1778,6 +1790,11 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
+    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
+    # QuickReduce (and its codec, such as INT4) from the measured message size.
+    # Unset keeps the built-in order.
+    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
@@ -1995,6 +2012,14 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # Opt-in: with --enable-linear-replayssm-spec and a 16-bit --mamba-ssm-dtype,
+    # the EAGLE / NEXTN / NGRAM verify commit keeps accepted GDN history in the
+    # ring and folds a request into its checkpoint only when its next draft
+    # window would not fit, as an fp32 checkpoint does; the verify reads that
+    # history with the ring's low parts. Batches smaller than
+    # REPLAYSSM_LAZY_FOLD_MIN_STATES (gdn_replayssm_spec_decode.py) fold after
+    # every verify, as every batch does with the variable unset.
+    SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -2640,6 +2665,9 @@ class Envs:
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Qwen3.5 and GDN
+    # ROCm GDN decode: the packed recurrent kernel streams its fp32 state past the caches,
+    # and the fused QKVZ/BA Conv1D update runs one feature per lane. Bit-identical to stock.
+    SGLANG_DISABLE_ROCM_GDN_DECODE_TUNING = EnvBool(False)
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 
     # ===================================================================
