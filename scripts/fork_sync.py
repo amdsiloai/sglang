@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CONFIG_PATH = os.environ.get("FORK_SYNC_CONFIG", "scripts/fork_sync_config.json")
@@ -111,6 +112,54 @@ def team_logins():
     return [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
 
 
+COAUTHOR_QUERY = """query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
+pullRequests(states:OPEN,first:50,after:$cursor){pageInfo{hasNextPage endCursor}
+nodes{number commits(first:100){nodes{commit{messageBody author{user{login}}}}}}}}}"""
+NOREPLY_RE = re.compile(r"(?:\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com", re.I)
+COAUTHOR_RE = re.compile(r"(?im)^co-authored-by:.*$")
+
+
+def commit_logins(commit):
+    """Logins of a commit's author and of its Co-authored-by trailers that use a noreply address."""
+    out = set()
+    user = (commit.get("author") or {}).get("user") or {}
+    if user.get("login"):
+        out.add(user["login"].lower())
+    for line in COAUTHOR_RE.findall(commit.get("messageBody") or ""):
+        m = NOREPLY_RE.search(line)
+        if m:
+            out.add(m.group(1).lower())
+    return out
+
+
+def coauthored_numbers(logins, skip):
+    """Open upstream PRs with a team member as commit author or co-author."""
+    team = {x.lower() for x in logins}
+    owner, name = UPSTREAM_REPO.split("/", 1)
+    found, cursor = [], None
+    while True:
+        cmd = ["gh", "api", "graphql", "-f", f"query={COAUTHOR_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"]
+        if cursor:
+            cmd += ["-f", f"cursor={cursor}"]
+        for attempt in range(4):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+            time.sleep(5)
+        else:
+            print("warning: co-author scan stopped early: " + r.stderr.strip()[-200:], flush=True)
+            return found
+        page = json.loads(r.stdout)["data"]["repository"]["pullRequests"]
+        for node in page["nodes"]:
+            if node["number"] in skip:
+                continue
+            if any(commit_logins(c["commit"]) & team for c in node["commits"]["nodes"]):
+                found.append(node["number"])
+        if not page["pageInfo"]["hasNextPage"]:
+            return found
+        cursor = page["pageInfo"]["endCursor"]
+
+
 def load_open_prs():
     """The open PR subset, plus the drafts that were left out (kept to complete stacks)."""
     logins = team_logins()
@@ -120,6 +169,12 @@ def load_open_prs():
     for login in logins:
         for pr in gh_pr_list("-R", UPSTREAM_REPO, "--state", "open", "--author", login, "--limit", "200"):
             prs[pr["number"]] = pr
+    for num in coauthored_numbers(logins, set(prs)):
+        r = subprocess.run(["gh", "pr", "view", str(num), "-R", UPSTREAM_REPO, "--json", PR_FIELDS],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            prs[num] = json.loads(r.stdout)
+            print(f"selected #{num} through a team co-author", flush=True)
     r = subprocess.run(
         ["gh", "pr", "list", "-R", FORK_REPO, "--state", "open", "--label", "fork-only",
          "--limit", "100", "--json", PR_FIELDS],
