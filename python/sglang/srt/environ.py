@@ -1139,6 +1139,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1484,6 +1487,11 @@ class Envs:
     # Triton and Torch compilation
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
+    # Triton decode attention: each request takes cdiv(kv_len, N) KV splits, bounded by
+    # one wave of programs per batch and SGLANG_TRITON_DECODE_SPLIT_MAX splits (0 keeps
+    # the default heuristic).
+    SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS = EnvInt(0)
+    SGLANG_TRITON_DECODE_SPLIT_MAX = EnvInt(64)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
     # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
     # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
@@ -1778,6 +1786,11 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
+    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
+    # QuickReduce (and its codec, such as INT4) from the measured message size.
+    # Unset keeps the built-in order.
+    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
@@ -2350,6 +2363,11 @@ class Envs:
     # Decode and MTP verify attention all-reduce through the push all-reduce
     # (rank-order FP32 sum) instead of the multimem one-shot.
     SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
+    # Inkling2 on ROCm keeps exact all-reduces; the image's quantized quick reduce
+    # (ROCM_QUICK_REDUCE_QUANTIZATION) applies only with this set.
+    SGLANG_INKLING2_ALLOW_QUICK_REDUCE = EnvBool(False)
+    # Inkling2 on ROCm is validated on gfx950 only; this lets other ROCm GPUs try it.
+    SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM = EnvBool(False)
     # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
     # the FP32 token sums.
     SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
