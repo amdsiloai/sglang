@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -77,7 +78,7 @@ def hits(text, table):
     return found
 
 
-def classify(pr):
+def classify_by_content(pr):
     paths = [f["path"] for f in pr.get("files") or []]
     by_path = []
     for path in paths:
@@ -96,6 +97,12 @@ def classify(pr):
     return {"kind": "model", "models": models}
 
 
+def classify(pr):
+    c = classify_by_content(pr)
+    extra = [m for m in ISSUE_MODELS.get(pr.get("number"), []) if m not in c["models"]]
+    return {"kind": "model", "models": c["models"] + extra} if extra else c
+
+
 def approved(pr):
     return any(r.get("state") == "APPROVED" for r in pr.get("latestReviews") or [])
 
@@ -112,52 +119,118 @@ def team_logins():
     return [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
 
 
-COAUTHOR_QUERY = """query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
-pullRequests(states:OPEN,first:50,after:$cursor){pageInfo{hasNextPage endCursor}
-nodes{number commits(first:100){nodes{commit{messageBody author{user{login}}}}}}}}}"""
 NOREPLY_RE = re.compile(r"(?:\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com", re.I)
 COAUTHOR_RE = re.compile(r"(?im)^co-authored-by:.*$")
+ISSUE_TITLE_RE = re.compile(r"\bPRs?\s+to\s+use\s+for\s+([A-Za-z0-9.]+)", re.I)
+# Models that open issues on the fork ask a PR to join, by PR number.
+ISSUE_MODELS = {}
 
 
 def commit_logins(commit):
-    """Logins of a commit's author and of its Co-authored-by trailers that use a noreply address."""
-    out = set()
-    user = (commit.get("author") or {}).get("user") or {}
-    if user.get("login"):
-        out.add(user["login"].lower())
+    """Logins of a commit's authors (GitHub resolves its co-authors) and noreply Co-authored-by trailers."""
+    out = {(a.get("login") or "").lower() for a in commit.get("authors") or []}
     for line in COAUTHOR_RE.findall(commit.get("messageBody") or ""):
         m = NOREPLY_RE.search(line)
         if m:
             out.add(m.group(1).lower())
+    out.discard("")
     return out
 
 
-def coauthored_numbers(logins, skip):
-    """Open upstream PRs with a team member as commit author or co-author."""
-    team = {x.lower() for x in logins}
-    owner, name = UPSTREAM_REPO.split("/", 1)
-    found, cursor = [], None
-    while True:
-        cmd = ["gh", "api", "graphql", "-f", f"query={COAUTHOR_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"]
-        if cursor:
-            cmd += ["-f", f"cursor={cursor}"]
-        for attempt in range(4):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode == 0:
-                break
-            time.sleep(5)
-        else:
-            print("warning: co-author scan stopped early: " + r.stderr.strip()[-200:], flush=True)
-            return found
-        page = json.loads(r.stdout)["data"]["repository"]["pullRequests"]
-        for node in page["nodes"]:
-            if node["number"] in skip:
+def involved_numbers(logins):
+    """Open upstream PRs a team member commented on, was mentioned in, was assigned or reviewed."""
+    found = set()
+    for login in logins:
+        for qualifier in ("involves", "reviewed-by"):
+            query = f"repo:{UPSTREAM_REPO} is:pr is:open {qualifier}:{login}"
+            for attempt in range(4):
+                r = subprocess.run(
+                    ["gh", "api", "-X", "GET", "search/issues", "-f", f"q={query}", "-f", "per_page=100",
+                     "--paginate", "--jq", ".items[].number"],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    break
+                time.sleep(20)
+            else:
+                print(f"warning: search for {qualifier} failed: " + r.stderr.strip()[-200:], flush=True)
                 continue
-            if any(commit_logins(c["commit"]) & team for c in node["commits"]["nodes"]):
-                found.append(node["number"])
-        if not page["pageInfo"]["hasNextPage"]:
-            return found
-        cursor = page["pageInfo"]["endCursor"]
+            found.update(int(x) for x in r.stdout.split())
+            time.sleep(2.5)
+    return found
+
+
+COAUTHOR_CACHE = Path(os.environ.get("FORK_COAUTHOR_CACHE") or Path(tempfile.gettempdir()) / "fork-sync-coauthors.json")
+COAUTHOR_CACHE_TTL_S = 3 * 3600
+
+
+def coauthored_prs(logins, skip):
+    """Open upstream PRs where a team member is commit author or co-author, found among the PRs they took part in.
+
+    The scan is cached in the temp directory for the run, so the conflict step reuses the sync step's result.
+    The cache sits outside the checkout because the build runs git clean there."""
+    team = {x.lower() for x in logins}
+    key = {"upstream": UPSTREAM_REPO, "team": sorted(team), "skip": sorted(skip)}
+    try:
+        cached = json.loads(COAUTHOR_CACHE.read_text())
+        if cached.get("key") == key and time.time() - cached.get("time", 0) < COAUTHOR_CACHE_TTL_S:
+            print(f"co-author scan: reusing {len(cached['prs'])} cached PRs", flush=True)
+            return {int(n): pr for n, pr in cached["prs"].items()}
+    except (OSError, ValueError, KeyError):
+        pass
+    out = {}
+    for num in sorted(involved_numbers(logins) - set(skip)):
+        r = subprocess.run(["gh", "pr", "view", str(num), "-R", UPSTREAM_REPO, "--json", PR_FIELDS + ",commits"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            continue
+        pr = json.loads(r.stdout)
+        if any(commit_logins(c) & team for c in pr.pop("commits", None) or []):
+            out[num] = pr
+    COAUTHOR_CACHE.write_text(json.dumps({"key": key, "time": time.time(), "prs": {str(n): pr for n, pr in out.items()}}))
+    return out
+
+
+def issue_pr_numbers(body):
+    """PR numbers, one per line: 123, #123, '- #123' or a pull request URL. Text after the number is ignored."""
+    rx = re.compile(
+        r"^\s*(?:[-*]\s*)?(?:\[[ xX]\]\s*)?(?:https://github\.com/" + re.escape(UPSTREAM_REPO) + r"/pull/|#)?(\d+)\b"
+    )
+    return [int(m.group(1)) for m in map(rx.match, (body or "").splitlines()) if m]
+
+
+def load_issue_prs(prs):
+    """Open fork issues titled 'PRs to use for <model>' list PRs to put on that model's branches."""
+    ISSUE_MODELS.clear()
+    r = subprocess.run(["gh", "issue", "list", "-R", FORK_REPO, "--state", "open", "--limit", "100",
+                        "--json", "number,title,body"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("warning: listing fork issues failed: " + r.stderr.strip()[-200:], flush=True)
+        return
+    names = {name.lower(): name for name, _ in MODELS}
+    for issue in json.loads(r.stdout):
+        m = ISSUE_TITLE_RE.search(issue["title"])
+        if not m:
+            continue
+        model = names.get(m.group(1).lower())
+        if not model:
+            print(f"warning: issue #{issue['number']} names an unknown model: {m.group(1)}", flush=True)
+            continue
+        for num in issue_pr_numbers(issue["body"]):
+            if num not in prs:
+                v = subprocess.run(["gh", "pr", "view", str(num), "-R", UPSTREAM_REPO, "--json", PR_FIELDS + ",state"],
+                                   capture_output=True, text=True)
+                if v.returncode != 0:
+                    print(f"warning: issue #{issue['number']}: PR {num} not found", flush=True)
+                    continue
+                pr = json.loads(v.stdout)
+                if pr.get("state") != "OPEN":
+                    print(f"warning: issue #{issue['number']}: PR {num} is not open", flush=True)
+                    continue
+                prs[num] = pr
+            if model not in ISSUE_MODELS.setdefault(num, []):
+                ISSUE_MODELS[num].append(model)
+            print(f"selected #{num} through issue #{issue['number']} for {model}", flush=True)
 
 
 def load_open_prs():
@@ -169,12 +242,10 @@ def load_open_prs():
     for login in logins:
         for pr in gh_pr_list("-R", UPSTREAM_REPO, "--state", "open", "--author", login, "--limit", "200"):
             prs[pr["number"]] = pr
-    for num in coauthored_numbers(logins, set(prs)):
-        r = subprocess.run(["gh", "pr", "view", str(num), "-R", UPSTREAM_REPO, "--json", PR_FIELDS],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            prs[num] = json.loads(r.stdout)
-            print(f"selected #{num} through a team co-author", flush=True)
+    for num, pr in coauthored_prs(logins, set(prs)).items():
+        prs[num] = pr
+        print(f"selected #{num} through a team co-author", flush=True)
+    load_issue_prs(prs)
     r = subprocess.run(
         ["gh", "pr", "list", "-R", FORK_REPO, "--state", "open", "--label", "fork-only",
          "--limit", "100", "--json", PR_FIELDS],
