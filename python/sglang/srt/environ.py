@@ -1262,6 +1262,10 @@ class Envs:
     # with SGLANG_USE_AITER=1 on gfx95x for Quark per-token FP8 linears, one input quant shared by in_proj_qkvz and
     # in_proj_ba, and the gated RMSNorm writing out_proj's FP8 input.
     SGLANG_AMD_GDN_PREFILL_FUSED = EnvBool(False)
+    # gfx950: Qwen sparse-attention (QSA) extend attention on AITER's FlyDSL sparse
+    # prefill (aiter.ops.qsa, ROCm/aiter#7556); prefill graph runs and calls the op
+    # refuses stay on Triton.
+    SGLANG_ROCM_QSA_FLYDSL_PREFILL = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")

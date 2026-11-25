@@ -2039,6 +2039,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx950, run gated hyper-connection sites with a per-branch norm (Qwen3.8) of more than 48 rows as Triton kernels on the raw residual (the down projection a split-K kernel up to 512 rows, a branch-batched GEMM above), without writing the normed residual. Rounding differs from the unfused path, and the folded weights (6.9 MB a site at Qwen3.8-Flash-Next's shapes) are allocated at the first eligible batch. Online weight updates are refused while it is on.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_QSA_FLYDSL_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx950, run the QSA extend attention of Qwen sparse-attention models (Qwen3.8-Flash-Next) on AITER's FlyDSL sparse prefill (<code>aiter.ops.qsa.qsa_sparse_prefill</code>, ROCm/aiter#7556) instead of the Triton kernels. Prefill CUDA graph runs and calls the op refuses stay on Triton; an AITER without the API logs a warning and keeps Triton.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
