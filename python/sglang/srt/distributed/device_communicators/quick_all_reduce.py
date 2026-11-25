@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -95,6 +95,7 @@ class QuickAllReduce:
         """
         self.disabled = True
         self._flydsl_int4 = None
+        self.first_min_bytes = envs.SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES.get()
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -272,12 +273,14 @@ class QuickAllReduce:
     def should_quick_allreduce(
         self,
         inp: torch.Tensor,
+        min_size: Optional[int] = None,
         *,
         ignore_min_size: bool = False,
         ignore_max_size: bool = False,
     ):
         """Check if quickreduce is available.
 
+        ``min_size`` replaces the codec's minimum size (``_QR_MIN_SIZE``).
         ``ignore_min_size`` skips the kernel-test floor in ``_QR_MIN_SIZE``.
         ``ignore_max_size`` skips ``qr_max_size``. The tuner uses both to time
         messages the server would refuse. Alignment and dtype checks still apply.
@@ -298,7 +301,9 @@ class QuickAllReduce:
             return False
         if not ignore_max_size and inp_size > self.qr_max_size:
             return False
-        if not ignore_min_size and inp_size < self._min_size(inp.dtype):
+        if min_size is None:
+            min_size = self._min_size(inp.dtype)
+        if not ignore_min_size and inp_size < min_size:
             return False
         return self._flydsl_int4 is None or self._flydsl_int4.should_quick_allreduce(
             inp
@@ -308,6 +313,13 @@ class QuickAllReduce:
         if self.use_fp16_kernels:
             dtype = torch.float16
         return self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
+
+    def should_quick_allreduce_first(self, inp: torch.Tensor) -> bool:
+        """Whether ``inp`` takes quick all-reduce ahead of the custom all-reduce:
+        it is at least SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES (0 = never)."""
+        return self.first_min_bytes > 0 and self.should_quick_allreduce(
+            inp, min_size=self.first_min_bytes
+        )
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
