@@ -36,6 +36,7 @@ def _rocm_sparse_decode_verify_supported() -> bool:
     """MI300 (gfx942) and MI350 (gfx950): EAGLE TARGET_VERIFY uses sparse decode kernels."""
     return is_gfx942_supported() or is_gfx95_supported()
 
+
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
         topk_index_reduce,
@@ -499,6 +500,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
+            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
             or (
                 (
                     self.is_npu
