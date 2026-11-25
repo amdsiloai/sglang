@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Attention module for the MiniMax H3 visual VAE (inference-only bundle).
+import importlib.util
 import math
 from typing import Optional
 
@@ -35,6 +36,16 @@ if _FORCE_ROCM_MATH_SDPA:
         from aiter import flash_attn_func as _rocm_flash_attn
     except ImportError:
         pass
+# FA dispatches through FA3, which is CUDA-only, so AITer is the fused kernel
+# available to the decoder's ViT blocks on ROCm.
+_ROCM_AITER_AVAILABLE = (
+    current_platform.is_rocm() and importlib.util.find_spec("aiter") is not None
+)
+_DEFAULT_ATTENTION_BACKEND = (
+    AttentionBackendEnum.AITER
+    if _ROCM_AITER_AVAILABLE
+    else AttentionBackendEnum.TORCH_SDPA
+)
 
 
 def _math_sdpa(query, key, value):
@@ -232,12 +243,13 @@ class Attention(nn.Module):
                 causal=False,
                 supported_attention_backends={
                     AttentionBackendEnum.FA,
+                    AttentionBackendEnum.AITER,
                     AttentionBackendEnum.TORCH_SDPA,
                 },
-                default_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+                default_attention_backend=_DEFAULT_ATTENTION_BACKEND,
                 skip_sequence_parallel=True,
             )
-            if current_platform.is_cuda()
+            if current_platform.is_cuda() or _ROCM_AITER_AVAILABLE
             else None
         )
 
