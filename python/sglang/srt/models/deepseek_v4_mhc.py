@@ -274,6 +274,12 @@ def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
     return mode.is_extend() and not mode.is_target_verify()
 
 
+def mega_mhc_on_decode() -> bool:
+    """Whether the decode and verify steps take prefill's Mega-mHC boundaries: opt-in on
+    HIP, where _can_use_mega_mhc still gates each seam."""
+    return _is_hip and envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.get()
+
+
 def is_deferred_finalize(routed) -> bool:
     """Whether a `MoEOutput` really carries an unfinalized handle for the post."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -854,6 +860,15 @@ def _hip_flydsl_mega_mhc(
     return HcState(updated, pre, HcNormed(normalized), stats)
 
 
+def _hip_flydsl_mega_mhc_nopost(
+    hc: HcSubLayer, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> HcState:
+    """No-post Mega-mHC on gfx950: this hyper-connection's combine, norm and triplet
+    in one launch; ``pre`` None takes stream 0."""
+    _, normalized, stats = _run_flydsl_mega_mhc(hc=hc, residual=residual, pre=pre)
+    return HcState(residual, pre, HcNormed(normalized), stats)
+
+
 def can_use_mega_closed_seam(hc: HcSubLayer) -> bool:
     """Whether gfx950 Mega-mHC can run this hyper-connection at a closed seam."""
     return (
@@ -864,9 +879,9 @@ def can_use_mega_closed_seam(hc: HcSubLayer) -> bool:
 
 
 def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
-    """At a closed seam (the first layer, an Engram layer) of a prefill step, one no-post
-    Mega-mHC launch runs the combine, norm and triplet. Consumes ``state``, as `combine`
-    would."""
+    """At a closed seam (the first layer, an Engram layer) of a prefill step (and of a
+    decode step, under `mega_mhc_on_decode`), one no-post Mega-mHC launch runs the
+    combine, norm and triplet. Consumes ``state``, as `combine` would."""
     if (
         not extend
         or state.input is not None
@@ -875,12 +890,37 @@ def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
     ):
         return state
     # The first layer has no pre: identity pre takes stream 0, as `_combine` does.
-    _, normalized, stats = _run_flydsl_mega_mhc(
-        hc=hc, residual=state.residual, pre=state.pre
-    )
-    opened = HcState(state.residual, state.pre, HcNormed(normalized), stats)
+    opened = _hip_flydsl_mega_mhc_nopost(hc=hc, residual=state.residual, pre=state.pre)
     state.release()
     return opened
+
+
+def can_use_mega_draft(attn: HcSubLayer, ffn: HcSubLayer) -> bool:
+    """Whether a DSpark draft stage takes its seams through Mega-mHC
+    (SGLANG_OPT_DSV41_MEGA_MHC_DRAFT, gfx950)."""
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_DRAFT.get()
+        and can_use_mega_closed_seam(attn)
+        and can_use_mega_closed_seam(ffn)
+    )
+
+
+def mega_draft_open(
+    hc: HcSubLayer, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> HcState:
+    """A draft stage's attention seam in one no-post launch: the sublayer input
+    ``norm(sum_k pre[k] * R[k])`` (stream 0 without a pre, as `_combine`) and the
+    triplet from ``residual``, which `mix_stats` would compute."""
+    return _hip_flydsl_mega_mhc_nopost(hc=hc, residual=residual, pre=pre)
+
+
+def mega_draft_post(y: torch.Tensor, opened: HcState, nxt: HcSubLayer) -> HcState:
+    """The attention post of an opened draft seam, with the FFN's triplet, combine and
+    norm, in one launch."""
+    pre, post_mix, comb = opened.stats
+    return _hip_flydsl_mega_mhc(
+        y=y, residual=opened.residual, pre=pre, post_mix=post_mix, comb=comb, nxt=nxt
+    )
 
 
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
