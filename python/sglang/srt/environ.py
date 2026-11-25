@@ -1086,6 +1086,7 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_ROCM_MIMO_FUSED_FRONT = EnvBool(False)
     # gfx950, ROCM_QUICK_REDUCE_QUANTIZATION=INT4: run QuickReduce through aiter's
     # QuickAllReduce dispatcher (FlyDSL INT4) instead of SGLang's HIP INT4 kernel.
     SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE = EnvBool(False)
