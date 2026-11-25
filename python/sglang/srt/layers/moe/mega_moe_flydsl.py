@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -26,7 +27,6 @@ from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +190,15 @@ def build_mega_moe_experts_weights(layer) -> None:
 
     w13_scale = scale_param("w13_weight_scale")
     w2_scale = scale_param("w2_weight_scale")
+    if tuple(layer.w13_weight.shape) == (48, 4096, 3072) and tuple(
+        layer.w2_weight.shape
+    ) == (48, 6144, 1024):
+        layer._mega_w1 = layer.w13_weight.data.contiguous().view(torch.uint8)
+        layer._mega_w1_scale = w13_scale.data.contiguous().view(torch.uint8)
+        layer._mega_w2 = layer.w2_weight.data.contiguous().view(torch.uint8)
+        layer._mega_w2_scale = w2_scale.data.contiguous().view(torch.uint8)
+        layer._mega_moe_weights_built = True
+        return
     layer._mega_w1, layer._mega_w1_scale = shuffle_existing(
         layer.w13_weight.data, w13_scale.data, gate_up=True
     )
@@ -197,11 +206,6 @@ def build_mega_moe_experts_weights(layer) -> None:
         layer.w2_weight.data, w2_scale.data, gate_up=False
     )
 
-    experts = layer.w13_weight.shape[0]
-    layer.w13_weight.data = layer._mega_w1.view(experts, -1)
-    w13_scale.data = layer._mega_w1_scale.view(experts, -1)
-    layer.w2_weight.data = layer._mega_w2.view(experts, -1)
-    w2_scale.data = layer._mega_w2_scale.view(experts, -1)
     layer._mega_moe_weights_built = True
 
 
@@ -244,6 +248,12 @@ def _get_or_build_mega_moe(
             w2_scale=layer._mega_w2_scale,
             max_tok_per_rank=capacity,
             swiglu_limit=swiglu_limit,
+            small_m_mtprs=(
+                (128, 256)
+                if (world, model_dim, inter_dim, experts, topk, quant, swiglu_limit)
+                == (8, 6144, 2048, 384, 8, "a8w4", 0.0)
+                else (256, 512)
+            ),
         )
         logger.info("Aiter MegaMoE: built capacity max_tok_per_rank=%d", capacity)
     return _MEGA_MOE_INSTANCE[(*shape_key, mtpr)]
@@ -333,17 +343,34 @@ def _recv_token_bound(num_tokens: int, ep_world: int, max_recv: int) -> int | No
 
 
 def _swap_layer_weights(mega, layer) -> None:
-    mega._s1_w1 = layer._mega_w1
-    mega._s1_w1_scale = layer._mega_w1_scale
-    mega.w2 = layer._mega_w2
-    mega.w2_scale = layer._mega_w2_scale
+    mega.bind_layer(
+        getattr(layer, "layer_id", 0),
+        layer._mega_w1,
+        layer._mega_w1_scale,
+        layer._mega_w2,
+        layer._mega_w2_scale,
+    )
 
 
-def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
-    if not get_moe_a2a_backend().is_megamoe():
+def _rank_consistent_max_tokens(hidden_states: torch.Tensor) -> int:
+    global_num_tokens = get_dp_global_num_tokens()
+    if global_num_tokens and not is_dsa_enable_prefill_cp():
+        return max(global_num_tokens)
+    return hidden_states.shape[0]
+
+
+def should_use_mega_moe(moe: Any, hidden_states: torch.Tensor) -> bool:
+    if (
+        not getattr(moe, "_use_target_mega_moe", False)
+        and not get_moe_a2a_backend().is_megamoe()
+    ):
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+    if getattr(moe, "_use_target_mega_moe", False):
+        return _rank_consistent_max_tokens(hidden_states) <= int(
+            os.getenv("SGLANG_MIMO_MEGA_MAX_TOKENS", "256")
+        )
     if get_is_capture_mode():
         return True
     global_num_tokens = get_dp_global_num_tokens()
@@ -356,20 +383,25 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 
 
 def forward_mega_moe(
-    moe: DeepseekV2MoE,
+    moe: Any,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch | None = None,
     input_ids_global: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
-    overlap = _should_overlap_shared_and_routed(moe, num_tokens)
+    shared_forward = getattr(moe, "_forward_shared_experts", None)
+    overlap = shared_forward is not None and _should_overlap_shared_and_routed(
+        moe, num_tokens
+    )
     if overlap:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
-        shared_output = moe._forward_shared_experts(hidden_states)
+        shared_output = shared_forward(hidden_states)
         stream_context = torch.cuda.stream(moe.alt_stream)
     else:
-        shared_output = moe._forward_shared_experts(hidden_states)
+        shared_output = (
+            shared_forward(hidden_states) if shared_forward is not None else None
+        )
         stream_context = nullcontext()
 
     with stream_context:
@@ -382,32 +414,39 @@ def forward_mega_moe(
 
 
 def _should_overlap_shared_and_routed(
-    moe: DeepseekV2MoE,
+    moe: Any,
     num_tokens: int,
 ) -> bool:
     if envs.SGLANG_AITER_MEGA_RANK_SYNC.get():
         return False
     return (
-        moe.alt_stream is not None
-        and moe.num_fused_shared_experts == 0
+        getattr(moe, "alt_stream", None) is not None
+        and getattr(moe, "num_fused_shared_experts", 0) == 0
         and num_tokens > 0
         and get_is_capture_mode()
     )
 
 
 def _run_mega_routed(
-    moe: DeepseekV2MoE,
+    moe: Any,
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch | None,
     input_ids_global: torch.Tensor | None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
     hidden_size = moe.config.hidden_size
-    topk = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
+    topk = moe.config.num_experts_per_tok + getattr(moe, "num_fused_shared_experts", 0)
     experts = moe.experts.num_experts
     if num_tokens:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+        router_forward = getattr(moe, "_mega_moe_router_logits", None)
+        router_logits = (
+            router_forward(hidden_states, forward_batch)
+            if router_forward is not None
+            else moe.gate(hidden_states, forward_batch=forward_batch)
+        )
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(moe, "is_hash", False) else {}
+        )
         topk_output = moe.topk(
             hidden_states,
             router_logits,
@@ -484,6 +523,25 @@ def _run_mega_routed(
                 x_in.shape[0], ep_world, ep_world * selected_mtpr
             ),
         )[:num_tokens]
+    elif getattr(moe, "_use_target_mega_moe", False):
+        mega = _get_or_build_mega_moe(
+            moe.experts,
+            model_dim=hidden_size,
+            inter_dim=moe.config.moe_intermediate_size,
+            experts=experts,
+            topk=topk,
+            quant=envs.SGLANG_AMD_FLYDSL_MEGA_QUANT.get() or "a8w4",
+            swiglu_limit=swiglu_limit,
+            mtpr=selected_mtpr,
+        )
+        _swap_layer_weights(mega, moe.experts)
+        output = mega.forward_small_m(
+            x_in,
+            topk_weights,
+            topk_ids,
+            slice_output=False,
+            max_tokens=_rank_consistent_max_tokens(hidden_states),
+        )[:num_tokens]
     else:
         mega = _get_or_build_mega_moe(
             moe.experts,
@@ -500,6 +558,8 @@ def _run_mega_routed(
             :num_tokens
         ]
 
-    if not moe.routed_scaling_factor_fused_in_topk:
-        output.mul_(moe.routed_scaling_factor)
+    if not getattr(moe, "routed_scaling_factor_fused_in_topk", True):
+        output.mul_(getattr(moe, "routed_scaling_factor", 1.0))
+    if getattr(moe, "_use_target_mega_moe", False):
+        output.mul_(1.0 / get_parallel().moe_ep_size)
     return output
