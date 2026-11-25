@@ -1239,7 +1239,10 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    # Kimi-K3 ROCm static FP8 dense linears: auto (wide on gfx95 without
+    # --enable-amd-monokernel, else off) | off | front | wide.
+    # See layers/quantization/k3_rocm_dense_fp8.py.
+    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("auto")
     # Kimi-K3 on ROCm: comma list of dense groups that get a prefill-only FP8
     # copy next to their BF16 weight (k3_rocm_prefill_fp8); empty = off.
     SGLANG_K3_PREFILL_DENSE_FP8 = EnvStr("")
