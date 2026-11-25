@@ -838,7 +838,14 @@ def _needs_device_weight_postprocess(
 
 def _config_needs_device_weight_postprocess(quant_config: QuantizationConfig) -> bool:
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
+    if quant_name in (
+        "modelopt_fp8",
+        "comfy_fp8",
+        "auto-round",
+        "mxfp8",
+        "mxfp6",
+        "a6w4",
+    ):
         return True
     # convrot_int8 is deliberately absent: both backends quantize each layer
     # through their own CUDA round trip, so an offloaded DiT stays on the host.
@@ -1082,12 +1089,15 @@ def _resolve_quant_config(
                 "such as owner/repo:Q4_K_M)."
             )
 
-        # Online-quant convention: for an ONLINE_QUANTIZATION_METHODS entry, a
-        # no-arg QuantizationConfig() selects the post-load path -- weights
-        # load in source dtype and are quantized in
+        # Online-quant convention: for an ONLINE_QUANTIZATION_METHODS entry
+        # (and for `mxfp6` / `a6w4`), a no-arg QuantizationConfig() selects the
+        # post-load path -- weights load in source dtype and are quantized in
         # process_weights_after_loading. Only those configs take
-        # --quantization-ignored-layers and --quantization-overrides.
+        # --quantization-ignored-layers; only ONLINE_QUANTIZATION_METHODS
+        # entries take --quantization-overrides.
         quant_cls = get_quantization_config(server_args.quantization)
+        if server_args.quantization in {"mxfp6", "a6w4"}:
+            return quant_cls(ignored_layers=server_args.quantization_ignored_layers)
         if server_args.quantization not in ONLINE_QUANTIZATION_METHODS:
             return quant_cls()
         if not server_args.quantization_overrides:
