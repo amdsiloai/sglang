@@ -1,9 +1,33 @@
-"""Load an all-reduce tune table and pick a backend for a message size.
+"""Load an all-reduce tune table and pick a communicator class for a message size.
 
-The tuner writes ``allreduce_configs.json``. Message sizes at runtime are not
-the handful of sizes that were measured, so a call uses the largest measured
-size that does not exceed the tensor. A tensor smaller than every row uses
-the smallest row.
+``python -m sglang.auto_tune.run_allreduce`` writes ``allreduce_configs_<mode>.json``.
+Each row's ``backend`` is the full class name the tuner timed, for example
+``sglang.srt.distributed.device_communicators.pynccl.PyNcclCommunicator``.
+``method`` is the collective that row timed: ``allreduce``,
+``quick_all_reduce``, ``custom_all_reduce``, ``outplace_all_reduce``, or
+``all_reduce``. The server opens one communicator per class and calls the
+collective that class defines. The same method name is a different call on
+another class. A table written before ``method`` existed names a class and
+records no collective, so that class is not opened.
+A table from an eager run goes in ``SGLANG_TUNED_EAGER_CONFIG``; a table from
+a ``--graph 1`` run goes in ``SGLANG_TUNED_GRAPH_CONFIG``. Either may be
+unset, which keeps the built-in order for that stage.
+
+The older single table in ``SGLANG_ALLREDUCE_TUNE_CONFIG`` names short
+backends (``custom_allreduce``, ``nccl``, ``quick_allreduce_INT4``, ...).
+``parse_tune_backend`` maps those to a dispatch method, and ``row.backend``
+is the same string as ``row.class_name``.
+
+Message sizes at runtime are not the handful of sizes that were measured, so
+a call uses the largest measured size that does not exceed the tensor. A
+tensor smaller than every row uses the smallest row.
+
+``qr_quant`` and ``qr_cast_bf16_to_fp16`` are kept beside the class name.
+``QuickAllReduce`` reads both from the environment at construction, and the
+class name does not carry the codec that was measured.
+``fly_algorithm`` is the FlyDSL schedule (``mesh`` or ``ring``). Both
+``QuickAllReduceInt4`` and ``FlyQuickAllReduce`` take it at construction,
+and the class name does not carry it.
 """
 
 from __future__ import annotations
@@ -20,9 +44,7 @@ logger = logging.getLogger(__name__)
 _LOAD_CACHE: Dict[Tuple[str, int], Optional["AllreduceTuneTable"]] = {}
 
 # Groups whose all-reduce is the tensor-parallel reduction the tuner measured.
-TUNE_TABLE_GROUPS = frozenset(
-    {"tp", "attention_tp", "moe_tp", "shared_experts_tp"}
-)
+TUNE_TABLE_GROUPS = frozenset({"tp", "attention_tp", "moe_tp", "shared_experts_tp"})
 
 _QR_PREFIX = "quick_allreduce_"
 
@@ -30,8 +52,14 @@ _QR_PREFIX = "quick_allreduce_"
 @dataclass(frozen=True)
 class TuneRow:
     size_bytes: int
-    backend: str
+    class_name: str
     dtype: str
+    method: str = ""
+
+    @property
+    def backend(self) -> str:
+        """The row's ``backend`` string. Older tables hold a short name here."""
+        return self.class_name
 
 
 class AllreduceTuneTable:
@@ -39,28 +67,68 @@ class AllreduceTuneTable:
         self,
         rows: Sequence[TuneRow],
         tp_size: Optional[int],
+        mode: Optional[str],
         source: str,
+        qr_quant: Optional[str] = None,
+        qr_cast_bf16_to_fp16: Optional[bool] = None,
+        fly_algorithm: str = "mesh",
     ) -> None:
-        self.rows = tuple(sorted(rows, key=lambda row: row.size_bytes))
-        self.tp_size = tp_size
-        self.source = source
+        self.rows: Tuple[TuneRow, ...] = tuple(
+            sorted(rows, key=lambda row: row.size_bytes)
+        )
+        self.tp_size: Optional[int] = tp_size
+        self.mode: Optional[str] = mode
+        self.source: str = source
+        self.qr_quant: Optional[str] = qr_quant
+        self.qr_cast_bf16_to_fp16: Optional[bool] = qr_cast_bf16_to_fp16
+        self.fly_algorithm: str = fly_algorithm
         self._cache: Dict[Tuple[int, str], str] = {}
 
     @property
     def qr_codecs(self) -> Tuple[str, ...]:
         codecs: List[str] = []
         for row in self.rows:
-            if not row.backend.startswith(_QR_PREFIX):
+            if not row.class_name.startswith(_QR_PREFIX):
                 continue
-            codec = row.backend[len(_QR_PREFIX) :]
+            codec = row.class_name[len(_QR_PREFIX) :]
             if codec and codec not in codecs:
                 codecs.append(codec)
         return tuple(codecs)
 
     def has_backend(self, name: str) -> bool:
-        return any(row.backend == name for row in self.rows)
+        return any(row.class_name == name for row in self.rows)
 
     def backend_for(self, nbytes: int, dtype: str) -> str:
+        return self.class_for(nbytes, dtype)
+
+    def class_names(self) -> Tuple[str, ...]:
+        """Full class names named by at least one row, smallest size first."""
+        return tuple(dict.fromkeys(row.class_name for row in self.rows))
+
+    def method_for(self, class_name: str) -> str:
+        """Collective the tuner timed for this class.
+
+        Empty when the rows omit it or name more than one. One class is
+        opened once, so every row that names it must agree.
+        """
+        found: List[str] = []
+        for row in self.rows:
+            if row.class_name != class_name or not row.method:
+                continue
+            if row.method not in found:
+                found.append(row.method)
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            logger.warning(
+                "[AR] Tune table %s names %s with methods %s. Not opening it.",
+                self.source,
+                class_name,
+                ", ".join(found),
+            )
+        return ""
+
+    def class_for(self, nbytes: int, dtype: str) -> str:
         key = (nbytes, dtype)
         cached = self._cache.get(key)
         if cached is not None:
@@ -73,12 +141,12 @@ class AllreduceTuneTable:
                 chosen = row
             else:
                 break
-        self._cache[key] = chosen.backend
-        return chosen.backend
+        self._cache[key] = chosen.class_name
+        return chosen.class_name
 
 
 def parse_tune_backend(backend: str) -> Optional[str]:
-    """Map a tuner backend name to the dispatch method.
+    """Map an older table's short backend name to the dispatch method.
 
     ``None`` means the name is not a backend this table can select.
     ``"nccl"`` is the process-group all-reduce. On ROCm that group is RCCL.
@@ -106,22 +174,29 @@ def parse_tune_backend(backend: str) -> Optional[str]:
 def load_allreduce_tune_table(
     path: Optional[str],
     world_size: int,
+    expected_mode: Optional[str] = None,
 ) -> Optional[AllreduceTuneTable]:
+    """Read one table. ``expected_mode`` is ``"eager"`` or ``"graph"``.
+
+    ``None`` is the single ``SGLANG_ALLREDUCE_TUNE_CONFIG`` table, which
+    serves both stages and is not checked against the table's ``mode``.
+    """
     if not path:
         return None
-    cached = _LOAD_CACHE.get((path, world_size))
-    if cached is not None or (path, world_size) in _LOAD_CACHE:
-        return cached
+    key = (path, world_size)
+    if key in _LOAD_CACHE:
+        return _LOAD_CACHE[key]
+    _LOAD_CACHE[key] = None
     if not os.path.isfile(path):
-        logger.warning("[AR] Tune table %s does not exist. Using the built-in order.", path)
-        _LOAD_CACHE[(path, world_size)] = None
+        logger.warning(
+            "[AR] Tune table %s does not exist. Using the built-in order.", path
+        )
         return None
     try:
         with open(path) as fh:
             payload = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("[AR] Could not read tune table %s: %s", path, exc)
-        _LOAD_CACHE[(path, world_size)] = None
         return None
 
     tp_size = payload.get("tp_size")
@@ -133,8 +208,19 @@ def load_allreduce_tune_table(
             tp_size,
             world_size,
         )
-        _LOAD_CACHE[(path, world_size)] = None
         return None
+
+    mode = payload.get("mode")
+    if mode is not None and expected_mode is not None and mode != expected_mode:
+        # Still used: the file is the user's choice. The warning is there
+        # because eager and graph timings of AITER differ by the copy-in.
+        logger.warning(
+            "[AR] Tune table %s was measured in %s mode but is set as the %s "
+            "table.",
+            path,
+            mode,
+            expected_mode,
+        )
 
     rows: List[TuneRow] = []
     for entry in payload.get("configs") or []:
@@ -142,23 +228,49 @@ def load_allreduce_tune_table(
             rows.append(
                 TuneRow(
                     size_bytes=int(entry["size_bytes"]),
-                    backend=str(entry["backend"]),
+                    class_name=str(entry["backend"]),
                     dtype=str(entry.get("dtype") or ""),
+                    method=str(entry.get("method") or ""),
                 )
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("[AR] Skipping a tune-table row in %s: %s", path, exc)
     if not rows:
-        logger.warning("[AR] Tune table %s has no rows. Using the built-in order.", path)
-        _LOAD_CACHE[(path, world_size)] = None
+        logger.warning(
+            "[AR] Tune table %s has no rows. Using the built-in order.", path
+        )
         return None
 
-    table = AllreduceTuneTable(rows, tp_size, path)
+    qr_quant = payload.get("qr_quant") or None
+    if qr_quant is not None:
+        qr_quant = str(qr_quant)
+    cast = payload.get("qr_cast_bf16_to_fp16")
+    qr_cast = None if cast is None else bool(int(cast))
+    fly_algorithm = str(payload.get("fly_algorithm") or "mesh")
+    if fly_algorithm not in ("mesh", "ring"):
+        logger.warning(
+            "[AR] Tune table %s has fly_algorithm=%s. FlyDSL opens as mesh.",
+            path,
+            fly_algorithm,
+        )
+        fly_algorithm = "mesh"
+    table = AllreduceTuneTable(
+        rows,
+        tp_size,
+        mode,
+        path,
+        qr_quant=qr_quant,
+        qr_cast_bf16_to_fp16=qr_cast,
+        fly_algorithm=fly_algorithm,
+    )
     logger.info(
-        "[AR] Tune table %s (tp=%s): %s",
+        "[AR] %s tune table %s (tp=%s, qr_quant=%s, fly_algorithm=%s): %s",
+        expected_mode or "all-stage",
         path,
         tp_size,
-        ", ".join(f"{row.size_bytes}B->{row.backend}" for row in table.rows),
+        qr_quant,
+        fly_algorithm,
+        ", ".join(f"{row.size_bytes}B->{row.class_name}" for row in table.rows),
     )
-    _LOAD_CACHE[(path, world_size)] = table
+    _LOAD_CACHE[key] = table
     return table

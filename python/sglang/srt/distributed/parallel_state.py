@@ -56,6 +56,11 @@ from sglang.srt.distributed.device_communicators.allreduce_tune_table import (
     load_allreduce_tune_table,
     parse_tune_backend,
 )
+from sglang.srt.distributed.device_communicators.tuned_allreduce import (
+    ShareKey,
+    TunedAllReduce,
+    _TUNED_METHOD_PREFIX,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -504,6 +509,7 @@ class GroupCoordinator:
                 group_name=group_name,
             )
 
+        # Default communicators. The built-in order picks among these.
         self.ca_comm: Optional[Any] = None
         self.ca_v2_comm: Optional[Any] = None
         self.ca_sglang_comm: Optional[Any] = None
@@ -516,6 +522,20 @@ class GroupCoordinator:
             self.allreduce_tune = load_allreduce_tune_table(
                 envs.SGLANG_ALLREDUCE_TUNE_CONFIG.get(),
                 self.world_size,
+            )
+        # One instance per table. None when that table was not given. The
+        # shared ``opened`` map below keeps one communicator per class name
+        # across the two instances.
+        self.tuned_eager: Optional[TunedAllReduce] = None
+        self.tuned_graph: Optional[TunedAllReduce] = None
+        eager_table = None
+        graph_table = None
+        if self.group_name in TUNE_TABLE_GROUPS and self.world_size > 1:
+            eager_table = load_allreduce_tune_table(
+                envs.SGLANG_TUNED_EAGER_CONFIG.get(), self.world_size, "eager"
+            )
+            graph_table = load_allreduce_tune_table(
+                envs.SGLANG_TUNED_GRAPH_CONFIG.get(), self.world_size, "graph"
             )
 
         self.pcie_ipc_comm: Optional[Any] = None
@@ -679,6 +699,24 @@ class GroupCoordinator:
                 device=self.device,
             )
 
+        # After every default communicator, so a table class can reuse one.
+        # QuickAllReduce is shared only when both tables measured the same codec.
+        opened: Dict[str, Optional[Any]] = {}
+        opened_qr: Dict[str, ShareKey] = {}
+        if eager_table is not None:
+            self.tuned_eager = TunedAllReduce(self, eager_table, opened, opened_qr)
+        if graph_table is not None:
+            self.tuned_graph = TunedAllReduce(self, graph_table, opened, opened_qr)
+        if opened and self.rank_in_group == 0:
+            logger.info(
+                "[AR] Tuned all-reduce on group %s: eager=%s (%s), graph=%s (%s)",
+                self.group_name,
+                eager_table.source if eager_table else "built-in",
+                ", ".join(self.tuned_eager.comms) if self.tuned_eager else "nothing opened",
+                graph_table.source if graph_table else "built-in",
+                ", ".join(self.tuned_graph.comms) if self.tuned_graph else "nothing opened",
+            )
+
         # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -706,6 +744,34 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+
+    def _tuned_stage(self) -> Optional[TunedAllReduce]:
+        """Tune payload for this call.
+
+        A call recorded into a CUDA graph uses the graph instance; any other
+        call, including warm-up runs inside the capture context and the split
+        ops of a piecewise graph, uses the eager instance. Either is None when
+        that table was not given.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return self.tuned_graph
+        return self.tuned_eager
+
+    def _tuned_custom_ar_comms(self) -> List[Any]:
+        """Custom all-reduce objects either payload holds, each once.
+
+        Identity, not a second open: eager and graph share the communicator,
+        and ``graph_capture`` must enter that one object. A second instance
+        would copy the input into its own staging buffer during capture.
+        """
+        comms: List[Any] = []
+        for stage in (self.tuned_eager, self.tuned_graph):
+            if stage is None:
+                continue
+            for comm in stage.custom_ar_comms():
+                if all(comm is not seen for seen in comms):
+                    comms.append(comm)
+        return comms
 
     def __repr__(self):
         return (
@@ -778,8 +844,15 @@ class GroupCoordinator:
             stream = graph_capture_context.stream
         # We don't need the context of custom quick allreduce because the ipc access
         # is already collected in init() and we can capture the quick allreduce directly.
-        ca_comm = self.ca_comm
-        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        # Every custom all-reduce enters its own capture context, including the
+        # ones only a tune table opened. The context is what makes
+        # ``custom_all_reduce`` hand the kernel the input itself instead of
+        # copying it into a staging buffer, and what registers the captured
+        # inputs with the peers on exit.
+        capture_comms: List[Any] = []
+        for comm in (self.ca_comm, *self._tuned_custom_ar_comms()):
+            if comm is not None and all(comm is not seen for seen in capture_comms):
+                capture_comms.append(comm)
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -787,7 +860,9 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with self.device_module.stream(stream), contextlib.ExitStack() as ca_contexts:
+            for comm in capture_comms:
+                ca_contexts.enter_context(comm.capture())
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -888,6 +963,8 @@ class GroupCoordinator:
             if (
                 self.ca_comm is None
                 and self.qr_comm is None
+                and not self.tuned_eager
+                and not self.tuned_graph
                 and self.pymscclpp_comm is None
                 and self.torch_symm_mem_comm is None
                 and pynccl_comm is None
@@ -1182,7 +1259,7 @@ class GroupCoordinator:
             self._tune_fallback_logged = True
         return _TUNE_NO_DECISION
 
-    def _resolve_outplace_all_reduce_method(
+    def _builtin_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
@@ -1237,6 +1314,20 @@ class GroupCoordinator:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             return "pynccl"
         return None
+
+    def _resolve_outplace_all_reduce_method(
+        self,
+        input_: torch.Tensor,
+        should_use_pymscclpp_allreduce: Optional[bool] = None,
+    ) -> Optional[str]:
+        stage = self._tuned_stage()
+        if stage is not None:
+            tuned = stage.select_method(input_)
+            if tuned is not None:
+                return tuned
+        return self._builtin_outplace_all_reduce_method(
+            input_, should_use_pymscclpp_allreduce
+        )
 
     def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
         if self._fi_workspace_hint is None:
@@ -1297,6 +1388,24 @@ class GroupCoordinator:
                     out = input_.clone()
                     self._all_reduce_in_place(out)
                     return out
+        if outplace_all_reduce_method.startswith(_TUNED_METHOD_PREFIX):
+            stage = self._tuned_stage()
+            out = None if stage is None else stage.apply_tuned(input_)
+            if out is not None:
+                return out
+            # The table named a communicator that cannot run this tensor.
+            fallback = self._builtin_outplace_all_reduce_method(input_)
+            if fallback == "pymscclpp":
+                input_ = input_.clone()
+            elif fallback is None:
+                if pynccl_comm is not None:
+                    fallback = "pynccl"
+                else:
+                    out = input_.clone()
+                    self._all_reduce_in_place(out)
+                    return out
+            assert fallback is not None
+            outplace_all_reduce_method = fallback
         if outplace_all_reduce_method == "nccl":
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
@@ -2346,7 +2455,25 @@ class GroupCoordinator:
             self.pcie_ipc_comm = None
         # Also before destroy_process_group(): the symmetric workspace is released
         # collectively on cpu_group, after the custom all-reduce drops its views.
+        # Both tune maps can hold the same object, so each object is closed
+        # once. The default ca_comm is separate. Symmetric memory keeps its
+        # own teardown.
+        closed = set()
+        tuned = [
+            comm
+            for stage in (self.tuned_eager, self.tuned_graph)
+            if stage is not None
+            for comm in stage.comms.values()
+        ]
+        for comm in (self.ca_comm, *tuned):
+            if comm is None or id(comm) in closed:
+                continue
+            closed.add(id(comm))
+            if hasattr(comm, "close"):
+                comm.close()
         self.ca_comm = None
+        self.tuned_eager = None
+        self.tuned_graph = None
         if self.cpu_group is not None:
             from sglang.srt.distributed.device_communicators.symm_workspace import (
                 close_group_symm_workspaces,
