@@ -2908,15 +2908,25 @@ class KimiK3DeltaAttention(nn.Module):
         if self._qkvg_gate_float_shard:
             # The BF16 g shard cannot join the int8/quantized merged-GEMM fusion.
             return False
+        # Not do_fuse_qkvbfg: it requires quant_config is None, which quantized
+        # checkpoints never meet even though their attention linears stay bf16.
         if not (
-            self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel or _is_gfx95
+            self.head_tp_size == self.tp_size
+            or get_exec().kernel.enable_amd_monokernel
+            or _is_gfx95
         ):
             return False
         # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
         if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             return False
-        ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
+        mods = (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)
+        # The merged buffer is applied through fused_qkvg_proj's quant method and
+        # carries only .weight, and online quantization replaces .weight after
+        # this runs, so every projection must stay unquantized.
+        if not all(isinstance(m.quant_method, UnquantizedLinearMethod) for m in mods):
+            return False
+        ws = [m.weight for m in mods]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
         # Whitelist the dtype rather than only require the three to agree: the
