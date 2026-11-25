@@ -1012,6 +1012,9 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_identity_scale = torch.ones(
                 (), dtype=torch.float32, device=self.device
             )
+            self.aiter_dsa_extend_metadata_owner = None
+            self.aiter_dsa_extend_kv_last_page_lens = None
+            self.aiter_dsa_extend_persistent_kwargs = None
 
             if (
                 self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
@@ -1351,6 +1354,35 @@ class DeepseekSparseAttnBackend(
 
         kv_last_page_lens = self.aiter_dsa_decode_kv_last_page_lens
         persistent_kwargs = self.aiter_dsa_decode_persistent_kwargs
+        assert kv_last_page_lens is not None
+        assert persistent_kwargs is not None
+        return kv_last_page_lens, persistent_kwargs
+
+    def _get_aiter_dsa_extend_metadata(
+        self,
+        metadata_owner: DSAMetadata,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        bs: int,
+        max_seqlen_q: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.aiter_dsa_extend_metadata_owner is not metadata_owner:
+            prepared = self._prepare_aiter_dsa_decode_metadata(
+                qo_indptr,
+                kv_indptr,
+                bs,
+                max_seqlen_q,
+                q_dtype,
+                kv_dtype,
+            )
+            self.aiter_dsa_extend_kv_last_page_lens = prepared.pop("kv_last_page_lens")
+            self.aiter_dsa_extend_persistent_kwargs = prepared
+            self.aiter_dsa_extend_metadata_owner = metadata_owner
+
+        kv_last_page_lens = self.aiter_dsa_extend_kv_last_page_lens
+        persistent_kwargs = self.aiter_dsa_extend_persistent_kwargs
         assert kv_last_page_lens is not None
         assert persistent_kwargs is not None
         return kv_last_page_lens, persistent_kwargs
@@ -4640,15 +4672,17 @@ class DeepseekSparseAttnBackend(
         )
         kv_last_page_lens = cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
+            kv_last_page_lens, aiter_persistent_kwargs = (
+                self._get_aiter_dsa_extend_metadata(
+                    self.forward_metadata,
+                    cu_seqlens_q,
+                    kv_indptr,
+                    num_tokens,
+                    1,
+                    q_kernel.dtype,
+                    kv_cache.dtype,
+                )
             )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
         # TODO support more forward_mode
         mla_decode_fwd(
