@@ -1962,6 +1962,18 @@ class Scheduler(
                 self.truncation_align_size, dsa_index_kpool
             )
 
+        # Deterministic mode: a prompt's prefill depends on where it is split, so
+        # chunk ends go on the chunked-prefill grid (a multiple of the alignment above).
+        chunk = self.chunked_prefill_size
+        if (
+            get_exec().deterministic.enable_deterministic_inference
+            and chunk is not None
+            and chunk >= self.truncation_align_size
+        ):
+            self.truncation_align_size = (
+                chunk // self.truncation_align_size * self.truncation_align_size
+            )
+
     def init_qsa_truncation_align(self):
         """Compressed QSA asserts that every extend's prefix is a whole number
         of compress groups, so a chunk cut short of its prompt must end on that
