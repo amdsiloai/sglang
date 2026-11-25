@@ -83,6 +83,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.mxfp8_block_convert import (
     mxfp8_block_convert_required,
@@ -198,27 +199,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 _DENSE_MXSCALE_LOGGED: set = set()
 
-DSV4_DEQUANT_FP4_TABLE = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+DSV4_DEQUANT_FP4_TABLE = torch.tensor(E2M1_VALUES, dtype=torch.float32)
 
 
 def cast_e2m1fn_to_e4m3fn(
@@ -534,7 +515,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
         if _is_cuda:
-            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            force_marlin = envs.SGLANG_FORCE_FP8_MARLIN.get()
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
@@ -2193,7 +2174,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # AMD FP4 experts: use aiter's native MXFP4 MoE path.
             elif not self.dequant_fp4_to_fp8:
-                gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                requires_interleave_default = (
+                    _is_gfx1250_supported
+                    or getattr(layer, "fp8_activations", None) is not None
+                )
+                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.is_set():
+                    gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                else:
+                    gu_intv = requires_interleave_default
                 fp4_weight_dtype = _require_fp4_dtype()
 
                 # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
