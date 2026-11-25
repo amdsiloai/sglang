@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
@@ -88,6 +89,28 @@ def _pick_inner_iter(
             if ni % larger == 0 and blocks >= 0.8 * slots * -(-blocks // slots):
                 return larger
     return it
+
+
+def _sparse_fwd_inner_iter(
+    seq: int,
+    ni: int,
+    cu: int,
+    block_per_cu: int,
+    any_divisor: bool = False,
+    head_blocks: int = 1,
+) -> int:
+    # A row's selected key blocks are summed in groups of inner_iter, so in
+    # batch-invariant mode the grouping must not follow the batch's token count.
+    if is_batch_invariant_mode_enabled():
+        return 1
+    return _pick_inner_iter(
+        seq,
+        ni,
+        cu,
+        block_per_cu,
+        any_divisor=any_divisor,
+        head_blocks=head_blocks,
+    )
 
 
 @tilelang.jit(
@@ -1224,7 +1247,7 @@ def tilelang_sparse_fwd(
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
             ni = topk // block_I
             # Any divisor is measured on CUDA only; ROCm keeps trying ni, ni // 2, ...
-            inner_iter = _pick_inner_iter(
+            inner_iter = _sparse_fwd_inner_iter(
                 q.shape[0],
                 ni,
                 cu,
@@ -1249,7 +1272,7 @@ def tilelang_sparse_fwd(
             else:
                 block_I, threads, block_per_cu, cu = 32, 128, 1, 304
             ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+            inner_iter = _sparse_fwd_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial(
                 num_heads,
                 d_v,
