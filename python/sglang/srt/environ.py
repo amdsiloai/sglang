@@ -1262,6 +1262,9 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Rotate those projections by a 32-wide block Hadamard matrix before MXFP4.
+    # Needs hadamard_rotate on per_1x32_f4_quant_hip (ROCm/aiter#6734).
+    SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD = EnvBool(True)
     # gfx950 only: the gated hyper-connection mix and combine of more than 48 rows
     # run as Triton kernels (the down projection a split-K kernel up to 512 rows, torch.bmm
     # above) without the normed residual.

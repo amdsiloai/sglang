@@ -2040,6 +2040,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Rotate each 32-wide block of the input dimension of the <code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code> projections by the orthonormal 32-point Hadamard matrix before MXFP4: the weight once at load, the activation inside the AITER MXFP4 quant. The product does not change, and the quantization error is lower. Needs AITER with <code>hadamard_rotate</code> on <code>per_1x32_f4_quant_hip</code> (ROCm/aiter#6734). Set to <code>0</code> for plain MXFP4.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_OPUS_FP8_PREFILL</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4.1 on gfx950, with <code>SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=1</code>: run the OPUS sparse prefill on the FP8 KV cache rows (AITER's FP8 OPUS kernel) instead of a BF16 copy of them. Applies to layers with the V4 cache layout and at most 32 local heads; other layers keep the BF16 kernel. Needs an AITER build with <code>pa_sparse_prefill_fp8_opus</code>; without it the BF16 kernel runs.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
