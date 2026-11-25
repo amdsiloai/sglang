@@ -17,7 +17,6 @@ for rows with a state slot, and CUDA graph replay must match eager.
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +24,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
     commit_gdn_replayssm_after_verify,
     commit_gdn_replayssm_spec,
-    gdn_replayssm_spec_decode,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -184,24 +182,15 @@ class _Arm:
         backend.kernel_dispatcher = self.dispatcher
         backend.mis_metadata = None
         backend._use_strided_target_verify_qkv = False
-        backend._replayssm_compensated_history = False
         hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
         hybrid.linear_attn_backend = backend
         self.hybrid = hybrid
         return backend
 
-    def commit(
-        self,
-        accept_steps,
-        req_rows,
-        track_slots=None,
-        track_steps=None,
-        fold_every_commit=False,
-    ):
+    def commit(self, accept_steps, req_rows, track_slots=None, track_steps=None):
         if self.lazy:
-            # The generic spec commit of an fp32 state or, under the opt-in, a
-            # 16-bit one: fold only when the next window would not fit, so
-            # later verifies replay history, or every row (fold_every_commit).
+            # The generic spec commit of an fp32 state: fold only when the
+            # next window would not fit, so later verifies replay history.
             metadata = self.hybrid.linear_attn_backend.forward_metadata
             commit_gdn_replayssm_after_verify(
                 spec_state=self.state,
@@ -213,7 +202,7 @@ class _Arm:
                 accept_lens=accept_steps + 1,
                 last_correct_step_indices=accept_steps,
                 max_spec_len=WIDTH,
-                fold_every_commit=fold_every_commit,
+                fold_every_commit=False,
             )
             return
         self.hybrid.linear_attn_backend.forward_metadata.mamba_track_indices = (
@@ -297,71 +286,20 @@ def _gdn_reference(layer, conv_state, ssm_state, mixed_qkv, a, b):
 
     q, k = l2norm(q) * HEAD_DIM**-0.5, l2norm(k)
     v = v.view(steps, V_HEADS, HEAD_DIM)
-    outputs, states = _delta_rule(ssm_state, q, k, v, a, b, layer.A_log, layer.dt_bias)
-    windows = [x[:, t + 1 : t + CONV_WIDTH] for t in range(steps)]
-    return outputs, states, windows
-
-
-def _delta_rule(state, q, k, v, a, b, A_log, dt_bias):
-    """float64 gated delta rule over one window from `state` [HV, V, K];
-    q and k per value head and normalized. Returns per-step outputs and
-    states."""
-    g = -torch.exp(A_log.double()) * F.softplus(a.double() + dt_bias.double())
+    g = -torch.exp(layer.A_log.double()) * F.softplus(
+        a.double() + layer.dt_bias.double()
+    )
     beta = torch.sigmoid(b.double())
-    state = state.double()
+    state = ssm_state.double()
     outputs, states = [], []
-    for t in range(q.shape[0]):
+    for t in range(steps):
         state = state * torch.exp(g[t])[:, None, None]
         delta = beta[t][:, None] * (v[t] - torch.einsum("hvk,hk->hv", state, k[t]))
         state = state + delta[:, :, None] * k[t][:, None, :]
         outputs.append(torch.einsum("hvk,hk->hv", state, q[t]))
         states.append(state)
-    return torch.stack(outputs), states
-
-
-def _verify_reference(kwargs, i):
-    """float64 outputs of request i's window from the state its verify reads:
-    the checkpoint advanced by the ring's live entries (high and low parts),
-    then the window's tokens."""
-    slot, row = int(kwargs["ssm_state_indices"][i]), int(kwargs["replay_indices"][i])
-    length, ring = int(kwargs["write_pos"][row]), kwargs["max_cache_len"]
-    phys = (int(kwargs["cache_base"][row]) + torch.arange(length)) % ring
-    group = V_HEADS // HEADS
-    d = kwargs["d_cache"][row].double() + kwargs["rawv_cache"][row].double()
-    k = kwargs["k_cache"][row].double() + kwargs["rawk_cache"][row].double()
-    g = kwargs["g_cache"][row][:, phys].double()
-    decay = torch.exp(g.sum(-1, keepdim=True) - g.cumsum(-1))
-    state = kwargs["checkpoint_state"][slot].double() * torch.exp(g.sum(-1))[
-        :, None, None
-    ] + torch.einsum(
-        "htv,htk->hvk",
-        d[:, phys] * decay[..., None],
-        k[:, phys].repeat_interleave(group, dim=0),
-    )
-
-    rows = slice(
-        int(kwargs["query_start_loc"][i]), int(kwargs["query_start_loc"][i + 1])
-    )
-
-    def l2norm(t, scale=1.0):
-        t = t.float()
-        return t * (1.0 / torch.sqrt((t * t).sum(-1, keepdim=True) + 1e-6) * scale)
-
-    # The verify's projections take q rounded to the activation dtype.
-    q = l2norm(kwargs["q"][rows], kwargs["scale"]).to(kwargs["q"].dtype)
-    q = q.double().repeat_interleave(group, dim=1)
-    k = l2norm(kwargs["k"][rows]).double().repeat_interleave(group, dim=1)
-    out, _ = _delta_rule(
-        state,
-        q,
-        k,
-        kwargs["v"][rows].double(),
-        kwargs["a"][rows],
-        kwargs["b"][rows],
-        kwargs["A_log"],
-        kwargs["dt_bias"],
-    )
-    return out
+    windows = [x[:, t + 1 : t + CONV_WIDTH] for t in range(steps)]
+    return torch.stack(outputs), states, windows
 
 
 def _relative_error(actual, expected):
@@ -391,86 +329,10 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
     def test_lazy_fold_chain_replays_history(self):
         """The generic spec commit of an fp32 state folds only when the next
         window would not fit the ring, so verifies replay committed history;
-        the outputs stay as close to the reference as the snapshot path's.
-        With SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD a bf16 checkpoint does the
-        same, and a commit that folds every row (a batch below the lazy fold's
-        size) folds each row's whole pending history: no history is left and
-        the checkpoint is as close to the reference as the snapshot path's."""
-        with self.subTest(ssm_dtype=torch.float32):
-            self._check_chain(torch.float32, num_steps=128, lazy=True)
-        with self.subTest(ssm_dtype=torch.bfloat16):
-            self._check_chain(torch.bfloat16, num_steps=480, lazy=True, eager_every=3)
+        the outputs stay as close to the reference as the snapshot path's."""
+        self._check_chain(torch.float32, num_steps=128, lazy=True)
 
-    def test_lazy_fold_bf16_verify_compensates_history(self):
-        """With SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD a bf16 checkpoint keeps
-        committed history in the ring, and the backend's verify reads it with
-        the ring's low parts. One window of fp32 outputs against float64 from
-        the checkpoint and ring the verify reads: a small fraction of the
-        error of reading the same ring without the low parts."""
-        torch.manual_seed(5)
-        layers = _make_layers()
-        req_rows, cache_indices = _rows_and_slots()
-        real_rows = req_rows[:NUM_REAL]
-        qsl = torch.arange(
-            0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
-        )
-        batch = _batch(NUM_SLOTS * WIDTH, req_rows)
-        arm = _Arm(
-            _template(torch.bfloat16),
-            replayssm=True,
-            dispatcher=self.dispatcher,
-            ring_len=4 * WIDTH,
-            lazy=True,
-        )
-        backend = arm.backend(qsl, cache_indices)
-        # The opt-in as GDNAttnBackend.__init__ reads it.
-        backend._replayssm_compensated_history = True
-        cache_base = arm.pool.replayssm_cache_base
-        cache_base[real_rows] = torch.tensor(
-            [31, 20, 17, 0, 9, 25], device="cuda", dtype=torch.int32
-        )
-        # Two commits keep 2 to 16 entries per row (no row folds).
-        accept_steps = torch.tensor([1, 3, WIDTH, 5, 2, 7], device="cuda") - 1
-        for _ in range(2):
-            _verify(backend, layers, batch, _dense_inputs())
-            arm.commit(accept_steps, real_rows)
-        history = arm.pool.replayssm_spec_write_pos[real_rows]
-        self.assertGreater(int(history.min()), 0)
-        # Some rows' history wraps past the end of the ring.
-        self.assertTrue(bool((cache_base[real_rows] + history > 4 * WIDTH).any()))
-
-        inputs = _dense_inputs()
-        errors = {}
-        for compensated in (True, False):
-            calls = []
-
-            def verify_fp32_out(**kwargs):
-                out = torch.empty_like(kwargs["out"], dtype=torch.float32)
-                gdn_replayssm_spec_decode(**{**kwargs, "out": out})
-                calls.append((kwargs, out))
-
-            backend._replayssm_compensated_history = compensated
-            with patch(
-                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
-                "gdn_replayssm_spec_decode",
-                verify_fp32_out,
-            ):
-                _verify(backend, layers, batch, inputs)
-            num, den = 0.0, 0.0
-            for kwargs, out in calls:
-                self.assertEqual(kwargs.get("compensated_history"), compensated)
-                for i in range(NUM_REAL):
-                    ref = _verify_reference(kwargs, i)
-                    rows = slice(i * WIDTH, (i + 1) * WIDTH)
-                    num += (out[rows].double() - ref).square().sum().item()
-                    den += ref.square().sum().item()
-            errors[compensated] = math.sqrt(num / den)
-        print(f"\nrelative RMS error, compensated / uncompensated: {errors}")
-        # About 0.002 on MI355X; 0.05 or more with any one compensation term
-        # left out.
-        self.assertLess(errors[True], 0.01 * errors[False])
-
-    def _check_chain(self, ssm_dtype, num_steps, lazy=False, eager_every=0):
+    def _check_chain(self, ssm_dtype, num_steps, lazy=False):
         torch.manual_seed(7)
         layers = _make_layers()
         template = _template(ssm_dtype)
@@ -492,10 +354,6 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             "snapshot": _Arm(template, replayssm=False, dispatcher=self.dispatcher),
         }
         backends = {name: arm.backend(qsl, cache_indices) for name, arm in arms.items()}
-        # The opt-in as GDNAttnBackend.__init__ reads it.
-        backends["replayssm"]._replayssm_compensated_history = (
-            lazy and ssm_dtype != torch.float32
-        )
         replayssm = arms["replayssm"]
         untouched_rows = [
             r for r in range(NUM_ROWS) if r not in set(real_rows.tolist())
@@ -510,16 +368,14 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         }
         # Under the lazy fold the checkpoint lags the committed state by the
         # history kept in the ring, so only the outputs are compared; they
-        # depend on the checkpoint and the replayed history together. States
-        # are compared after the commits that fold every row.
-        keys = ("out",) if lazy and not eager_every else ("out", "state")
+        # depend on the checkpoint and the replayed history together.
+        keys = ("out",) if lazy else ("out", "state")
         errors = {name: {key: [] for key in keys} for name in arms}
         batch = _batch(NUM_SLOTS * WIDTH, req_rows)
         generator = torch.Generator().manual_seed(11)
         expected_base = torch.zeros(NUM_REAL, dtype=torch.int64)
-        max_history = max_pending = 0
-        for step in range(num_steps):
-            eager = bool(eager_every) and step % eager_every == eager_every - 1
+        max_history = 0
+        for _ in range(num_steps):
             inputs = _dense_inputs()
             accept = torch.randint(1, WIDTH + 1, (NUM_REAL,), generator=generator)
             outputs = {
@@ -543,13 +399,8 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                     reference["temporal"][layer.layer_id, slot] = states[n - 1]
                     reference["conv"][layer.layer_id, slot] = windows[n - 1]
                 ref_out.append(torch.cat(layer_out))
-            if eager:
-                pending = replayssm.pool.replayssm_spec_write_pos[real_rows]
-                max_pending = max(max_pending, int(pending.max()))
             for name, arm in arms.items():
-                arm.commit(
-                    (accept - 1).cuda(), req_rows[:NUM_REAL], fold_every_commit=eager
-                )
+                arm.commit((accept - 1).cuda(), req_rows[:NUM_REAL])
                 out = torch.stack(
                     [
                         o.reshape(-1, V_HEADS, HEAD_DIM)[: NUM_REAL * WIDTH]
@@ -557,7 +408,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                     ]
                 )
                 errors[name]["out"].append(_relative_error(out, torch.stack(ref_out)))
-                if not lazy or eager:
+                if not lazy:
                     errors[name]["state"].append(
                         _relative_error(
                             arm.state.temporal[:, real_slots],
@@ -577,19 +428,16 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 padding = out.reshape(-1, V_HEADS, HEAD_DIM)[NUM_REAL * WIDTH :]
                 self.assertEqual(padding.abs().max().item(), 0.0)
             pool = replayssm.pool
-            if lazy and not eager:
+            if lazy:
                 history = pool.replayssm_spec_write_pos[real_rows]
                 max_history = max(max_history, int(history.max()))
                 continue
-            # Cursors: folded and reset.
+            # Cursors: folded and reset every commit, ring origin advanced.
+            expected_base = (expected_base + accept) % RING
             self.assertEqual(
                 pool.replayssm_spec_write_pos[real_rows].abs().sum().item(), 0
             )
             self.assertEqual(pool.replayssm_is_flush[real_rows].abs().sum().item(), 0)
-            if lazy:
-                continue
-            # Folding every commit, the ring origin advances by the accepted count.
-            expected_base = (expected_base + accept) % RING
             self.assertEqual(
                 pool.replayssm_cache_base[real_rows].cpu().tolist(),
                 expected_base.tolist(),
@@ -598,9 +446,6 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         if lazy:
             # Later verifies saw committed history.
             self.assertGreater(max_history, WIDTH)
-        if eager_every:
-            # Commits that fold every row found more than a window pending.
-            self.assertGreater(max_pending, WIDTH)
         pool = replayssm.pool
         for cursor in (
             pool.replayssm_spec_write_pos,

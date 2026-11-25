@@ -1,5 +1,7 @@
 """Global model alignment must not add attention-visible SP image rows."""
 
+import os
+import tempfile
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -9,15 +11,19 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    _release_device_state,
+)
 from sglang.multimodal_gen.runtime.models.dits.zimage import (
     ZImageAttention,
+    ZImageHeadPaddingWorkspace,
     ZImageTransformer2DModel,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 MODULE = "sglang.multimodal_gen.configs.pipeline_configs.zimage"
 MODEL = "sglang.multimodal_gen.runtime.models.dits.zimage"
@@ -105,6 +111,12 @@ class TestZImageSPPadding(CustomTestCase):
             self.assertFalse(self._plan()["image_sp_unpadded"])
         with torch.enable_grad():
             self.assertFalse(self._plan()["image_sp_unpadded"])
+        self.batch.rollout = True
+        self.batch.rollout_return_denoising_env = True
+        self.assertFalse(self._plan()["image_sp_unpadded"])
+        self.batch.rollout_return_denoising_env = False
+        self.assertTrue(self._plan()["image_sp_unpadded"])
+        self.batch.rollout = False
         for name in ("enable_teacache", "enable_spectrum", "enable_cache_dit"):
             setattr(self.batch, name, True)
             self.assertFalse(self._plan()["image_sp_unpadded"])
@@ -212,6 +224,9 @@ class TestZImageSPPadding(CustomTestCase):
                             self.assertEqual(in_splits[rank + 1], 4 * (rank + 1))
                         else:
                             self.assertEqual(value.shape[0], 0)
+                        if rank:
+                            self.assertEqual(out_splits[rank - 1], 4 * rank)
+                        self.assertEqual(sum(out_splits), 4 * rank)
                         start = rank * target_len
                         output.copy_(
                             global_tokens[:, start : start + 4 * rank].transpose(0, 1)
@@ -296,7 +311,7 @@ class TestZImageSPPadding(CustomTestCase):
     def test_head_padding_reuse_and_functional_gradients(self):
         attention = ZImageAttention.__new__(ZImageAttention)
         torch.nn.Module.__init__(attention)
-        attention._head_padding_buffers = [None, None, None]
+        attention._head_padding_workspace = ZImageHeadPaddingWorkspace()
         tensor = torch.arange(2 * 3 * 30 * 4).reshape(2, 3, 30, 4).float()
         padded = attention._pad_heads(tensor, slot=0, pad_heads=2, reuse=True)
         self.assertEqual(padded.shape, (2, 3, 32, 4))
@@ -315,7 +330,33 @@ class TestZImageSPPadding(CustomTestCase):
             torch.testing.assert_close(
                 source.grad, torch.ones_like(source), rtol=0, atol=0
             )
-        self.assertIs(attention._head_padding_buffers[0], resized)
+        self.assertIs(attention._head_padding_workspace._buffers[0], resized)
+
+    def test_head_padding_workspace_is_shared_and_released(self):
+        model = ZImageTransformer2DModel.__new__(ZImageTransformer2DModel)
+        torch.nn.Module.__init__(model)
+
+        def stack(count):
+            blocks = torch.nn.ModuleList()
+            for _ in range(count):
+                block = torch.nn.Module()
+                block.attention = ZImageAttention.__new__(ZImageAttention)
+                torch.nn.Module.__init__(block.attention)
+                blocks.append(block)
+            return blocks
+
+        model.noise_refiner, model.layers = stack(2), stack(3)
+        model._share_head_padding_workspaces()
+        tensor = torch.ones(1, 4, 30, 2)
+        first, last = model.layers[0].attention, model.layers[-1].attention
+        padded = first._pad_heads(tensor, slot=1, pad_heads=2, reuse=True)
+        self.assertIs(last._pad_heads(tensor, slot=1, pad_heads=2, reuse=True), padded)
+        refiner = model.noise_refiner[0].attention
+        refiner._pad_heads(tensor[:, :2], slot=1, pad_heads=2, reuse=True)
+        self.assertIs(first._pad_heads(tensor, slot=1, pad_heads=2, reuse=True), padded)
+        _release_device_state(model)
+        for workspace in model._head_padding_workspaces:
+            self.assertEqual(workspace._buffers, [None, None, None])
 
     def test_patchification_requires_explicit_admission(self):
         model = ZImageTransformer2DModel.__new__(ZImageTransformer2DModel)
@@ -325,6 +366,57 @@ class TestZImageSPPadding(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "real image length"):
             model.patchify_and_embed(
                 *args, image_seq_len_target=1024, image_sp_unpadded=True
+            )
+
+
+def _take_image_shards(rank, world_size, init_file):
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size
+    )
+    try:
+        # (image rows per rank, caption rows per rank, uses the gather fallback)
+        for image_local_len, cap_per_rank, uses_gather in (
+            (8, 2, False),
+            (2, 2, True),
+        ):
+            rows = world_size * (image_local_len + cap_per_rank)
+            unified = torch.arange(2 * rows * 3).reshape(2, rows, 3).float()
+            shard = unified.chunk(world_size, dim=1)[rank].contiguous()
+            with patch(
+                "torch.distributed.all_gather",
+                wraps=torch.distributed.all_gather,
+            ) as gather:
+                image = ZImageTransformer2DModel._take_image_shard(
+                    shard,
+                    image_local_len=image_local_len,
+                    cap_per_rank=cap_per_rank,
+                    ulysses_size=world_size,
+                    rank=rank,
+                    group=None,
+                )
+            assert gather.called == uses_gather, (rank, image_local_len)
+            start = rank * image_local_len
+            torch.testing.assert_close(
+                image,
+                unified[:, start : start + image_local_len],
+                rtol=0,
+                atol=0,
+            )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestZImageImageShardExchange(CustomTestCase):
+    def test_ranks_get_their_image_rows_back(self):
+        """Each rank must get back exactly its own image rows from its shard of
+        the joint image/caption sequence, through the window exchange and the
+        gather fallback."""
+        world_size = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            torch.multiprocessing.spawn(
+                _take_image_shards,
+                args=(world_size, os.path.join(tmp, "init")),
+                nprocs=world_size,
             )
 
 

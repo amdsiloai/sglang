@@ -114,6 +114,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    hip_fused_moe_routing,
     post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -504,6 +505,12 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def routes_with_fp32_correction_bias(config) -> bool:
+    """GLM-5.3-Flash's 288 fp32 biases per layer sit in a ~0.4-wide band where bf16
+    keeps 8-11 of them, which reorders top-k, so it routes with the fp32 bias."""
+    return config.model_type == "glm5_next_text"
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -530,7 +537,11 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
             # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not is_glm_moe_dsa(config):
+            if (
+                quant_config is not None
+                and not is_glm_moe_dsa(config)
+                and not routes_with_fp32_correction_bias(config)
+            ):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -1045,6 +1056,11 @@ class DeepseekV2MoE(nn.Module):
 
             bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
 
+        if hip_fused_moe_routing.enabled():
+            hip_fused_moe_routing.prepare(
+                torch.device("cuda", torch.cuda.current_device())
+            )
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -1106,6 +1122,14 @@ class DeepseekV2MoE(nn.Module):
             if forward_batch is not None
             else None
         )
+        if hip_fused_moe_routing.enabled():
+            hip_fused_moe_routing.set_decode(
+                forward_batch is not None
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+            )
         if should_use_gluon_moe(self):
             output = forward_gluon_moe(
                 self,
@@ -1249,6 +1273,8 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global,
                 )
             else:
+                if hip_fused_moe_routing.enabled():
+                    hip_fused_moe_routing.stage(hidden_states)
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -1438,6 +1464,8 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global,
                 )
             else:
+                if hip_fused_moe_routing.enabled():
+                    hip_fused_moe_routing.stage(hidden_states)
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -1485,11 +1513,15 @@ class DeepseekV2MoE(nn.Module):
                 topk_output,
                 pre_quant_input=pre_quant_input,
             )
+            if hip_fused_moe_routing.enabled():
+                hip_fused_moe_routing.clear()
         else:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
             )
+            if hip_fused_moe_routing.enabled():
+                hip_fused_moe_routing.clear()
         if (
             not _is_cuda
             and not _is_musa

@@ -58,9 +58,7 @@ from sglang.srt.speculative.spec_utils import (
     resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_device_core_count,
-    get_int_env_var,
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -372,9 +370,7 @@ class TritonAttnBackend(AttentionBackend):
         # BLOCK_M for Lean partial-result buffers; kept as an attribute so the
         # cuda-graph / eager buffer allocators (separate methods) can size them.
         self.lean_block_m = _LEAN_BLOCK_M
-        self.static_kv_splits = get_bool_env_var(
-            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
-        )
+        self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
         self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         if self.use_mla and not _is_xpu:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
@@ -410,9 +406,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if self.enable_deterministic:
             # Fixed split tile size for batch invariance
-            self.split_tile_size = get_int_env_var(
-                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
-            )
+            self.split_tile_size = envs.SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE.get()
             self.static_kv_splits = False
         else:
             self.split_tile_size = get_exec().kernel.triton_attention_split_tile_size
@@ -855,7 +849,12 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
-        if _is_hip:
+        # The fused ROCm fill covers one window rail and packs the read stream itself.
+        if (
+            _is_hip
+            and self.mla_dcp_window_verify is None
+            and len(self.window_lengths) <= 1
+        ):
             return _hip.update_target_verify_buffers(
                 self, plan, bs, seq_lens, spec_info, req_pool_indices
             )
@@ -1921,7 +1920,7 @@ class TritonAttnBackend(AttentionBackend):
         elif layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
-            o = torch.empty_like(q, dtype=layer.out_dtype or q.dtype)
+            o = torch.empty_like(q, dtype=getattr(layer, "out_dtype", None) or q.dtype)
         lse = (
             q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
             if return_lse
@@ -2623,7 +2622,10 @@ class TritonAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(
-                q, dtype=q.dtype if gate_sink else layer.out_dtype or q.dtype
+                q,
+                dtype=q.dtype
+                if gate_sink
+                else getattr(layer, "out_dtype", None) or q.dtype,
             )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
@@ -2712,6 +2714,7 @@ class TritonAttnBackend(AttentionBackend):
             self.enable_deterministic
             or envs.SGLANG_DISABLE_LEAN_ATTENTION.get()
             or return_lse
+            or gate_sink is not None
         ):
             enable_lean = False
         else:
