@@ -2260,7 +2260,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # AMD FP4 experts: use aiter's native MXFP4 MoE path.
             elif not self.dequant_fp4_to_fp8:
-                gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                requires_interleave_default = (
+                    _is_gfx1250_supported
+                    or getattr(layer, "fp8_activations", None) is not None
+                )
+                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.is_set():
+                    gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                else:
+                    gu_intv = requires_interleave_default
                 fp4_weight_dtype = _require_fp4_dtype()
 
                 # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
@@ -2389,6 +2396,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         )
                 layer.w13_weight.is_shuffled = is_shuffled
                 layer.w2_weight.is_shuffled = is_shuffled
+                if is_shuffled:
+                    layer._aiter_gate_up_interleaved = bool(gu_intv)
                 if get_moe_a2a_backend().is_megamoe():
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
@@ -3856,10 +3865,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         fused_moe_kwargs = None
         gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
-        if (
-            gate_up_interleaved is not None
-            and (self.moe_runner_config.swiglu_limit or 0.0) > 0
-        ):
+        if gate_up_interleaved is not None:
             from aiter.ops.flydsl.moe_common import GateMode
 
             fused_moe_kwargs = {
@@ -3869,6 +3875,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     else GateMode.SEPARATED.value
                 )
             }
+
+        fp8_activations = getattr(layer, "fp8_activations", None)
+        if fp8_activations is None:
+            fp8_activations = _is_shuffle_moe_mxfp4 and gate_up_interleaved is True
 
         return AiterMoeQuantInfo(
             w13_weight=w13_weight,
@@ -3880,9 +3890,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=_aiter_clamped_swiglu_limit(self.moe_runner_config),
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
-            fp8_activations=(
-                self.is_fp4_expert and getattr(layer, "fp8_activations", False)
-            ),
+            fp8_activations=self.is_fp4_expert and fp8_activations,
             fused_moe_kwargs=fused_moe_kwargs,
         )
 
