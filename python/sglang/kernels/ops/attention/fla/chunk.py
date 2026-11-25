@@ -207,11 +207,14 @@ def chunk_gated_delta_rule_fwd(
     output_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
-    # The pipelined scan does not map its output through output_indices.
+    # The pipelined scan does not map its output through output_indices, nor
+    # write the track_state snapshot.
     parts, seq_len = (
         (0, 0)
-        if out is not None
+        if out is not None or track_state is not None
         else _pipeline_plan(
             q,
             cu_seqlens,
@@ -260,6 +263,8 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
         chunk_offsets=chunk_offsets,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
     )
     o = chunk_fwd_o(
         q=q,
@@ -314,6 +319,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_indices: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         cu_seqlens_cpu: Optional[torch.LongTensor] = None,
+        track_state: Optional[torch.Tensor] = None,
+        track_chunk_idx: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -348,6 +355,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_indices=output_indices,
             output=output,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         return o.to(q.dtype), h
 
@@ -372,6 +381,8 @@ def chunk_gated_delta_rule(
     output_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
+    track_state: Optional[torch.Tensor] = None,
+    track_chunk_idx: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -412,6 +423,11 @@ def chunk_gated_delta_rule(
         cu_seqlens_cpu (Optional[torch.LongTensor]):
             `cu_seqlens` on the host. The kernels then plan from it instead of reading `cu_seqlens` back, which
             waits for the device. Default: `None`.
+        track_state (Optional[torch.Tensor]):
+            fp32 buffer of shape `[N, H, V, K]` that receives, for each sequence, the state at the
+            chunk boundary given by `track_chunk_idx` (a prefix-cache checkpoint). Default: `None`.
+        track_chunk_idx (Optional[torch.Tensor]):
+            Per-sequence chunk index of that boundary; passed together with `track_state`.
 
     Returns:
         o (torch.Tensor):
@@ -530,6 +546,8 @@ def chunk_gated_delta_rule(
         output_indices,
         output,
         cu_seqlens_cpu,
+        track_state,
+        track_chunk_idx,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
