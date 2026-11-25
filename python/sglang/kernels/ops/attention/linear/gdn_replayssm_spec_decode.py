@@ -1469,10 +1469,13 @@ def gdn_replayssm_spec_decode(
         and q.shape[-1] == 128
         and v.shape[-1] == 128
     )
-    if mtp_shape and batch_size >= 32:
-        # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and
-        # gate work across two programs on gfx950.
-        block_v, num_stages = 128, 1
+    # At the Qwen3.5 MTP shape on gfx950, one pipeline stage is faster at every
+    # batch size, and one wide V tile avoids duplicating q/k and gate work across
+    # two programs once the grid has enough (request, value head) programs.
+    if mtp_shape:
+        num_stages = 1
+        if batch_size * v.shape[-2] >= 768:
+            block_v = 128
     # With a BF16 checkpoint and low-part rings, normalize q/k and form their
     # products once per (request, key head) instead of once per (V tile,
     # value head) when the launch above has more programs than run at once.
