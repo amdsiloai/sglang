@@ -182,6 +182,12 @@ class TestMoeSortingSmall(CustomTestCase):
         ids, _ = self._routing(m, m)
         self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, 1024))
 
+    def test_k3_sort_plan_keeps_small_sort_at_513_experts(self):
+        m = 6
+        ids, _ = self._routing(m, m)
+        with self.S.k3_sort_plan():
+            self.assertTrue(self.S._small_sort_supported(ids, 32, None, None, self.E))
+
 
 def _reference(ids, w, num_experts, block_size):
     m, topk = ids.shape

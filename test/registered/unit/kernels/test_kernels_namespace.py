@@ -360,6 +360,9 @@ def test_minicpm_sala_package_exports_the_function_after_its_submodule():
         ("communication.all_reduce_push_res", KernelBackend.JIT, "cuda"),
         ("communication.gemm_ag_up_proj", KernelBackend.JIT, "cuda"),
         ("communication.reduce_scatter_res", KernelBackend.JIT, "cuda"),
+        ("moe.k3_route_sort_sort_quant", KernelBackend.TRITON, "hip"),
+        ("moe.k3_route_sort_mid_route_quant", KernelBackend.TRITON, "hip"),
+        ("moe.k3_moe_epi_shared_gemm_sort_quant", KernelBackend.TRITON, "hip"),
     ],
 )
 def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
