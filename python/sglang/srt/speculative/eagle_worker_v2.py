@@ -1318,8 +1318,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             probs, topk_p, topk_index = sample_draft_proposal(
                 logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
-                # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
-                batch.sampling_info.top_ks if self.use_fused_draft_sample else None,
+                batch.sampling_info.top_ks,
                 sampling_seed=batch.sampling_info.sampling_seed,
                 positions=batch.seq_lens,
                 fused=self.use_fused_draft_sample,
