@@ -52,6 +52,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    hip_fused_moe_routing,
     is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.moe.utils import (
@@ -103,7 +104,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_musa = is_musa()
 _is_sail = is_sail()
 
@@ -1045,7 +1046,6 @@ class TopK(BaseFusedOp):
                 num_token_non_padded, expert_location_dispatch_info
             )
         )
-        self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
         #   - support 'topk_softmax' and 'topk_sigmoid'
         #   - support up to 8 top-k and 256 experts
@@ -1529,47 +1529,6 @@ def grouped_topk_xpu(
         apply_routed_scaling_factor_on_output,
         scoring_func,
     )
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def kimi_k2_biased_topk_impl(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-    """
-    Optimized version for num_expert_group=1 case (e.g., Kimi K2 with 384 experts).
-    Simplifies the grouped topk logic by removing unnecessary group masking operations.
-    Note: This function assumes num_fused_shared_experts=0.
-    """
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    scores = gating_output.sigmoid()
-    num_token = scores.shape[0]
-
-    # When num_expert_group=1, no need for group masking
-    # Directly compute scores with correction bias
-    tmp_scores = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-
-    # Directly select topk experts (no need to sort since num_fused_shared_experts=0)
-    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
-    topk_weights = scores.gather(1, topk_ids)
-
-    if renormalize:
-        # fp32 like the reference gate (the epsilon is not representable in
-        # fp16); the sum dtype and the division's type promotion upcast inside
-        # the existing kernels, so no extra cast launch is needed
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-    if apply_routed_scaling_factor_on_output:
-        topk_weights *= routed_scaling_factor
-
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    return topk_weights, topk_ids
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -2371,7 +2330,6 @@ def biased_grouped_topk_cpu(
     renormalize: bool,
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
-    compiled: bool = True,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
@@ -3041,21 +2999,56 @@ def select_experts(
                 ):
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_shared_topk_slots
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=top_k_for_gate,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_shared_topk_slots_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                **_packed_kwargs,
-            )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            # SGLANG_OPT_HIP_FUSED_MOE_ROUTING: one kernel for top-k + shared slot + sort + MXFP8 quant
+            # above 256 rows; None falls back to the router below.
+            fused_routing = None
+            if hip_fused_moe_routing.enabled():
+                fused_routing = hip_fused_moe_routing.route_or_skip(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    correction_bias=correction_bias,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    shared_w=topk_config.fused_shared_experts_scaling_factor or 1.0,
+                    num_token_non_padded=num_token_non_padded,
+                    skip_reasons=(
+                        ("no aiter", not _use_aiter),
+                        ("scoring", scoring_func != "sqrtsoftplus"),
+                        ("shared slots", num_shared_topk_slots != 1),
+                        (
+                            "per-rank shared slots",
+                            has_per_rank_fused_shared_slots(num_shared_topk_slots),
+                        ),
+                        ("packed ids", packed_topk is not None),
+                        ("split-K partials", router_logits_partials is not None),
+                        ("routing overridden", routing_overridden),
+                        (
+                            "expert remapping",
+                            expert_location_dispatch_info is not None
+                            and is_expert_remapping_enabled(),
+                        ),
+                    ),
+                )
+            if fused_routing is None:
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k_for_gate,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_shared_topk_slots_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    **_packed_kwargs,
+                )
+                padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            else:
+                # [M, top_k]: the kernel writes the shared column too
+                topk_weights, topk_ids = fused_routing
+                padded_rows_masked = num_token_non_padded is not None
         elif (
             topk_config.runner_backend is not None
             and topk_config.runner_backend.is_flashinfer_trtllm_routed()
