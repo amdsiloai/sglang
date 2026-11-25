@@ -1260,6 +1260,9 @@ class Envs:
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
+    # GDN packed decode kernel: "aiter" runs AITER's FlyDSL GDR decode where it
+    # covers the launch; anything else keeps the Triton packed decode.
+    SGLANG_USE_HIP_GDN_PACKED_DECODE_BACKEND = EnvStr("triton")
     # Deprecated: use --fp4-gemm-backend aiter|triton. Honored with a
     # DeprecationWarning only while --fp4-gemm-backend is auto (see fp4_utils).
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
