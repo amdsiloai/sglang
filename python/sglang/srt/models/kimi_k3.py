@@ -95,6 +95,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    filter_moe_weight_param_global_expert,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -165,7 +166,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
-from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
+from sglang.srt.utils.common import BumpAllocator, LazyValue, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
 if TYPE_CHECKING:
@@ -667,13 +668,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         kda_dwdp: Optional[KdaDwdp] = None,
     ):
         super().__init__()
-        # K3 allocates one weight slot per logical expert. Online relocation
-        # and extra replicas require a separate weight-layout implementation.
-        if get_exec().moe.enable_eplb or get_exec().moe.ep_num_redundant_experts:
-            raise ValueError(
-                "Kimi-K3 supports initial expert placement without online EPLB "
-                "or redundant experts."
-            )
+        # K3 allocates one weight slot per logical expert, so EPLB relocates
+        # experts but cannot add replicas.
+        if get_exec().moe.ep_num_redundant_experts:
+            raise ValueError("Kimi-K3 does not support redundant experts.")
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
         moe_renormalize = config.moe_renormalize
@@ -947,6 +945,16 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 tp_size=self.tp_size,
                 tp_rank=get_parallel().tp_rank,
             )
+
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
 
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
@@ -4254,6 +4262,10 @@ class KimiK3LinearForCausalLM(nn.Module):
             num_groups=config.num_expert_group,
         )
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
     # ModelSlim describes quantization with the original checkpoint module
     # names. Register the runtime fused QKVG module so it can resolve the
     # q_proj scheme while the weight loader packs q/k/v/g into its shards.
@@ -4316,6 +4328,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, KimiK3MoE)
+            }
+        )
         self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self):
@@ -4821,6 +4840,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return KimiK3LinearForCausalLM.get_model_config_for_expert_location(
             config.text_config
         )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model.routed_experts_weights_of_layer
 
     supports_cuda_vmm_feature_transport = True
 
