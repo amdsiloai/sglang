@@ -191,6 +191,13 @@ def _aiter_fused_moe_supports_deterministic() -> bool:
 
 
 @functools.cache
+def _aiter_fused_moe_supports_stage2_fp8() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "stage2_fp8" in inspect.signature(fused_moe).parameters
+
+
+@functools.cache
 def _warn_no_deterministic_moe() -> None:
     logger.warning(
         "This AITER build's fused_moe has no deterministic option, so MXFP4 MoE "
