@@ -430,6 +430,130 @@ if HAS_TILELANG:
 
         return kernel
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_grouped_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        ctas_per_row: int = 1,
+        min_scored_len: int = 0,
+        threads: int = 128,
+        dtype: str = "bfloat16",
+        groups_per_cta: int = 0,
+    ):
+        GROUP = 64
+        group_rows = 4
+        score_heads = 4
+        assert heads >= score_heads and heads % 8 == 0
+        assert GROUP % page_size == 0
+        sub_pages = GROUP // page_size
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),
+            PageTable: T.Tensor([batch, max_pages], T.int32),
+            ContextLens: T.Tensor([batch], T.int32),
+            Logits: T.Tensor([batch, max_model_len], T.float32),
+            Scale: T.float32,
+        ):
+            # With groups_per_cta > 0 (ROCm) each CTA scores that many consecutive
+            # groups and the grid spans the page table; CTAs past a request's
+            # context exit at once.
+            grid_y = (
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta)
+                if groups_per_cta > 0
+                else ctas_per_row
+            )
+            with T.Kernel(T.ceildiv(batch, group_rows), grid_y, threads=threads) as (
+                request,
+                cta,
+            ):
+                row_base = request * group_rows
+                q_shared = T.alloc_shared([group_rows, score_heads, head_dim], dtype)
+                q_gemm = T.reshape(q_shared, (group_rows * score_heads, head_dim))
+                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
+                scores = T.alloc_fragment([GROUP, group_rows * score_heads], T.float32)
+                scores_3d = T.reshape(scores, (GROUP, group_rows, score_heads))
+                reduced = T.alloc_fragment([GROUP, group_rows], T.float32)
+                context_len = T.alloc_var(T.int32)
+                table_row = T.alloc_var(T.int32)
+                # Graph verify rows share page prefixes and have increasing lengths.
+                table_row = T.min(row_base + group_rows - 1, batch - 1)
+                context_len = ContextLens[table_row]
+                num_groups = T.ceildiv(context_len, GROUP)
+                if context_len > min_scored_len and (
+                    cta * groups_per_cta < num_groups
+                    if groups_per_cta > 0
+                    else cta < num_groups
+                ):
+                    T.copy(
+                        Q[
+                            row_base : row_base + group_rows,
+                            0,
+                            0:score_heads,
+                            0:head_dim,
+                        ],
+                        q_shared,
+                    )
+                    for step in T.serial(
+                        groups_per_cta
+                        if groups_per_cta > 0
+                        else T.ceildiv(num_groups - cta, ctas_per_row)
+                    ):
+                        group = (
+                            cta * groups_per_cta + step
+                            if groups_per_cta > 0
+                            else step * ctas_per_row + cta
+                        )
+                        for sp in range(sub_pages):
+                            if (group * sub_pages + sp) * page_size < context_len:
+                                T.copy(
+                                    KCache[
+                                        PageTable[table_row, group * sub_pages + sp],
+                                        :,
+                                        0,
+                                        :,
+                                    ],
+                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
+                                )
+                        T.gemm(
+                            k_shared,
+                            q_gemm,
+                            scores,
+                            transpose_B=True,
+                            clear_accum=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        for token, qi, head in T.Parallel(
+                            GROUP, group_rows, score_heads
+                        ):
+                            scores_3d[token, qi, head] = T.max(
+                                scores_3d[token, qi, head], 0.0
+                            )
+                        T.reduce_sum(scores_3d, reduced, dim=2, clear=True)
+                        for token, qi in T.Parallel(GROUP, group_rows):
+                            position = group * GROUP + token
+                            if row_base + qi < batch:
+                                if (
+                                    ContextLens[row_base + qi] > min_scored_len
+                                    and position < ContextLens[row_base + qi]
+                                ):
+                                    Logits[row_base + qi, position] = (
+                                        reduced[token, qi] / Scale
+                                    )
+
+        return kernel
+
 
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
@@ -595,6 +719,10 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+# ROCm grouped verify: four wavefronts and one group per CTA over a page-table-wide
+# grid beats 128 threads with a fixed CTA count per request on MI355X (bit-exact).
+_GROUPED_DECODE_THREADS = 256 if is_hip() else 128
+_GROUPED_DECODE_GROUPS_PER_CTA = 1 if is_hip() else 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -619,6 +747,8 @@ def tilelang_qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_request: int = 1,
+    num_query_heads: Optional[int] = None,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed.
 
@@ -663,10 +793,29 @@ def tilelang_qsa_mqa_decode(
         or (gfx95_launch and not page_table.shape[1])
     ):
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
+    use_grouped = (
+        rows_per_request == 4
+        and q.shape[0] <= 380
+        and q.shape[0] % 4 == 0
+        and (query_heads if num_query_heads is None else num_query_heads) == 4
+        and query_heads <= 16
+        and head_dim == 128
+        and page_size == 16
+        and q.is_cuda
+        and (
+            is_gfx95_supported()
+            or (
+                not is_hip()
+                and q.shape[0] >= 64
+                and torch.cuda.get_device_capability(q.device) == (10, 7)
+            )
+        )
+    )
+    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
+    # sixteen; the grouped kernel's N is four rows of four heads on both.
+    # Zero-padding preserves the weight-free head sum on every path.
+    head_alignment = 16 if is_hip() and not use_grouped else 8
     kernel_heads = max(
         head_alignment,
         ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
@@ -681,19 +830,32 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
-    _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        # Unused with groups_per_cta (it sets the grid); fixed so it does not
-        # multiply the kernel specializations.
-        ctas_per_row=(
-            1 if gfx95_launch else _decode_ctas_per_row(q.shape[0], q.device)
-        ),
-        min_scored_len=min_scored_len,
-        dtype=_TILELANG_DTYPES[scoring_dtype],
-        **gfx95_launch,
-    )(
+    if use_grouped:
+        kernel = _tilelang_qsa_mqa_decode_grouped_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            ctas_per_row=1 if _GROUPED_DECODE_GROUPS_PER_CTA else 32,
+            min_scored_len=min_scored_len,
+            threads=_GROUPED_DECODE_THREADS,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+            groups_per_cta=_GROUPED_DECODE_GROUPS_PER_CTA,
+        )
+    else:
+        kernel = _tilelang_qsa_mqa_decode_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            # Unused with groups_per_cta (it sets the grid); fixed so it does not
+            # multiply the kernel specializations.
+            ctas_per_row=(
+                1 if gfx95_launch else _decode_ctas_per_row(q.shape[0], q.device)
+            ),
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+            **gfx95_launch,
+        )
+    kernel(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
@@ -749,6 +911,8 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_request: int = 1,
+    num_query_heads: Optional[int] = None,
 ) -> torch.Tensor:
     if _is_npu:
         if score_scale is not None:
@@ -765,6 +929,8 @@ def qsa_mqa_decode(
             max_model_len,
             score_scale,
             min_scored_len=min_scored_len,
+            rows_per_request=rows_per_request,
+            num_query_heads=num_query_heads,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

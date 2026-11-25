@@ -177,6 +177,24 @@ def _select_prefill_tokens_fused(
     return output
 
 
+def _decode_rows_per_request(
+    forward_batch, indexer_metadata, is_target_verify: bool, is_draft_extend: bool
+) -> int:
+    """Rows per request for the decode scorer, which may share one key read across
+    them. Verify and draft-extend CUDA graphs lay out each request's rows back to
+    back on its page-table row with non-decreasing lengths (graph_metadata.py) and
+    the runners' padding requests last; eager batches score row by row."""
+    if not indexer_metadata.is_cuda_graph:
+        return 1
+    if is_target_verify:
+        return int(forward_batch.spec_info.draft_token_num)
+    if is_draft_extend:
+        # Every draft-extend batch fills its whole window (prepare_for_draft_extend),
+        # and the graph runners replay only their captured width.
+        return int(forward_batch.spec_info.num_tokens_per_req)
+    return 1
+
+
 class QSAIndexer(MultiPlatformOp):
     """Config-driven fused-QK, weight-free sparse-attention indexer."""
 
@@ -691,6 +709,7 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        rows_per_request: int = 1,
     ) -> torch.Tensor:
         # fast_topk and topk_v2 (k = 512) write 0..length-1 for rows that fit k
         # without reading their scores, and ignore scores past a row's length.
@@ -707,6 +726,8 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
             min_scored_len=self.block_topk if use_fast_topk else 0,
+            rows_per_request=rows_per_request,
+            num_query_heads=self.index_n_heads,
         )
         # On gfx95 topk_v2 (exact in its default mode) replaces fast_topk, which drops
         # members of an overfull threshold bin; the logits row stride must be a
@@ -945,6 +966,9 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                rows_per_request=_decode_rows_per_request(
+                    forward_batch, indexer_metadata, is_target_verify, is_draft_extend
+                ),
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
