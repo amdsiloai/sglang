@@ -966,6 +966,16 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             )
         ]
 
+    def get_moe_weights(self):
+        return [
+            x.data
+            for name, x in self.experts.named_parameters()
+            if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
+        ]
+
     def _merge_front_weights(self) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
 
