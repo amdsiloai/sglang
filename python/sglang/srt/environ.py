@@ -1176,6 +1176,9 @@ class Envs:
     # Experimental arena reader; see the AITER fixes in the unified-memory docs.
     # Keep opt-in until the fixed dependency is qualified in the default CI image.
     SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
+    # Try AITER's FlyDSL BF16 unified attention (gfx950, Q/K 192, V 128, page 64
+    # or 128) before its Triton unified attention in the AITER backend.
+    SGLANG_USE_AITER_FLYDSL_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
