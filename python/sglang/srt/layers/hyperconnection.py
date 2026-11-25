@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 from typing import Optional
 
@@ -6,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.gemm import hc_seam as _hc_seam
 from sglang.kernels.ops.gemm.hc_mix import (
     _deterministic_inference,
     fused_hc_mix,
@@ -17,8 +19,9 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 
+logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 # gfx950: HC sites of more than this many rows take the Triton path.
 _HC_PREFILL_MIN_ROWS = 48
@@ -27,6 +30,22 @@ _HC_PREFILL_MIN_ROWS = 48
 @lru_cache(None)
 def _hc_gate_stream(device: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device)
+
+
+# Fused HC seam (sglang/kernels/ops/gemm/hc_seam.py) for batches of
+# MIN_ROWS..MAX_ROWS rows; off by default, gfx950 only (where it is validated).
+_HC_SEAM = is_hip() and envs.SGLANG_ENABLE_QWEN4_HC_SEAM.get() and is_gfx95_supported()
+_HC_SEAM_MIN_ROWS = envs.SGLANG_QWEN4_HC_SEAM_MIN_ROWS.get()
+_HC_SEAM_MAX_ROWS = envs.SGLANG_QWEN4_HC_SEAM_MAX_ROWS.get()
+if _HC_SEAM:
+    logger.info(
+        "HC seam decode: Triton combine + norm + mix seam active for rows %d..%d.",
+        _HC_SEAM_MIN_ROWS,
+        _HC_SEAM_MAX_ROWS,
+    )
+# Stands in for the normalized residual of a stage whose read ran the seam: the
+# residuals' gate slot then holds the finished fp32 combine gate, not partials.
+SEAM_NORMED = torch.empty(0)
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -261,6 +280,54 @@ class GatedResidual(nn.Module):
         # on NPU with compatible dependencies.
         self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
         self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
+        self._seam_eligible = (
+            use_mix
+            and self.hc_count == _hc_seam.HC
+            and self.hidden_size == _hc_seam.HS
+            and self.config.hc_lowrank == _hc_seam.LOWRANK
+            and self.config.hc_per_branch_norm
+        )
+
+    def _seam_ok(self, hyper_input: torch.Tensor) -> bool:
+        rows = hyper_input.shape[0]
+        return (
+            _HC_SEAM
+            and self._seam_eligible
+            and _HC_SEAM_MIN_ROWS <= rows <= _HC_SEAM_MAX_ROWS
+            and not torch.compiler.is_compiling()
+            and _hc_seam.hc_seam_supported(rows, hyper_input)
+        )
+
+    def _seam_weights(self):
+        inject = getattr(self, "block_inject_weight", None)
+        return (
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            inject.weight if inject is not None else None,
+            self.config.rms_norm_eps,
+        )
+
+    def seam_combine_mix(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
+    ):
+        """The previous stage's combine fused with this stage's read, when the
+        previous stage's read ran the seam; None to take the separate path."""
+        hyper_input, normed, gate = residuals
+        if (
+            normed is not SEAM_NORMED
+            or gate is None
+            or block_output.dtype != torch.bfloat16
+            or not block_output.is_contiguous()
+            or not self._seam_ok(hyper_input)
+        ):
+            return None
+        residual, mixed, gate = _hc_seam.hc_seam(
+            block_output, hyper_input, gate, *self._seam_weights()
+        )
+        return mixed, (residual, SEAM_NORMED, gate)
 
     def _flydsl_mix_ok(self) -> bool:
         if self._mix_flydsl_ok is None:
@@ -319,6 +386,11 @@ class GatedResidual(nn.Module):
         tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
     ]:
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        if normalized_input is None and self._seam_ok(hyper_input):
+            _, mixed_input, gate = _hc_seam.hc_seam(
+                None, hyper_input, None, *self._seam_weights()
+            )
+            return mixed_input, (hyper_input, SEAM_NORMED, gate)
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
@@ -440,6 +512,8 @@ class GatedResidual(nn.Module):
         Callers must only pass the norm when no PLE or other update intervenes.
         """
         hyper_input, hyper_input_normed, partials = residuals
+        if hyper_input_normed is SEAM_NORMED:
+            return self.combine(block_output, residuals), None
         if hyper_input_normed is None:
             # The prefill mix's residuals: its partials are inject logits, and it
             # prepares no next norm.
@@ -473,6 +547,12 @@ class GatedResidual(nn.Module):
         residuals: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hyper_input, hyper_input_normed, partials = residuals
+        if hyper_input_normed is SEAM_NORMED:
+            if block_output.shape[0] == 0:
+                return hyper_input.to(self.params_dtype)
+            return _hc_seam.hc_gated_combine(
+                block_output.contiguous(), hyper_input, partials
+            )
         if hyper_input_normed is None:
             from sglang.kernels.ops.gemm.hc_prefill_triton import hc_prefill_combine
 
