@@ -2102,6 +2102,9 @@ class PrefillAdder:
                 # chunk budget left this pass depends on the other requests in it.
                 trunc_len = trunc_len // truncation_align_size * truncation_align_size
                 if trunc_len <= 0:
+                    # Wait rather than cut off the grid, which the next chunk's
+                    # prefix would inherit: the full chunk budget holds at least
+                    # one grid unit (check_truncation_align_fits_chunk).
                     return AddReqResult.OTHER
             if self.remainder_first:
                 trunc_len = self.remainder_first_len(
