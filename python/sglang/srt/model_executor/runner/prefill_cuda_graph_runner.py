@@ -403,7 +403,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model_config.hf_config
         )
         self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
-        self._qwen_bcg_mtp_draft = qwen_bcg and model_runner.is_draft_worker
+        # With speculative decoding on, the draft runner refuses multimodal
+        # batches and, under DP attention, follows the target's replay vote, so
+        # the target refuses them too. Algorithms without a draft model (NGRAM)
+        # keep refusing as well.
+        self._qwen_bcg_multimodal_eager = (
+            qwen_bcg and model_runner.spec_algorithm.is_speculative()
+        )
         self._mm_batches_eager = not getattr(
             model_runner.model, "prefill_graph_replays_mm_batches", True
         )
@@ -1498,8 +1504,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel
-            or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_multimodal_eager
             or getattr(self, "_mm_batches_eager", False)
         ):
             return False
