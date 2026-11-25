@@ -2229,6 +2229,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(self._leaf("attention_backend"), deterministic_fills[0])
 
+    def test_deterministic_inference_disables_mixed_chunk(self):
+        """A mixed batch runs decode tokens through the extend kernels, so deterministic
+        mode must not put prefill and decode tokens in one batch."""
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            enable_deterministic_inference=True,
+            enable_mixed_chunk=True,
+        )
+        self.assertFalse(resolution_result(sa, "enable_mixed_chunk"))
+        self.assertTrue(
+            resolution_result(
+                self._construct("LlamaForCausalLM", "llama", enable_mixed_chunk=True),
+                "enable_mixed_chunk",
+            )
+        )
+
     def test_deterministic_rocm_resolves_fp8_gemm_backend_to_triton(self):
         # The pass runs from the deterministic-inference hook during resolution.
         with override_platform(is_cuda=False, is_hip=True):
