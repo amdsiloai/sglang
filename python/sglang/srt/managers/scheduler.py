@@ -82,7 +82,7 @@ except ImportError:
 import traceback
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
-from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, kimi_linear_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -1934,6 +1934,10 @@ class Scheduler(
             from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
 
             aligns.append(CHUNK_SIZE)
+        if kimi_linear_config(self.model_config) is not None:
+            # Kimi Delta Attention prefills in 64-token chunks counted from the
+            # sequence start; a chunked-prefill split off that grid changes the result.
+            aligns.append(64)
         self.truncation_align_size = math.lcm(*aligns) if aligns else None
 
     def init_dsa_kpool_truncation_align(self):
