@@ -23,10 +23,20 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
     USE_AITER_GFX95,
+    USE_AITER_GFX1201,
     USE_AITER_GFX1250,
 )
 
 logger = logging.getLogger(__name__)
+
+_aiter_flash_attn_gfx1201 = None
+_aiter_fp8_quant_gfx1201 = None
+if USE_AITER_GFX1201:
+    try:
+        from aiter.ops.flydsl import flydsl_flash_attn_func as _aiter_flash_attn_gfx1201
+        from aiter.ops.flydsl import flydsl_fp8_quant as _aiter_fp8_quant_gfx1201
+    except ImportError:
+        pass
 
 _use_fp8_attn = os.environ.get("SGLANG_DIFFUSION_AITER_FP8_ATTN", "0") == "1"
 _fp8_dtype = torch.float8_e4m3fn
@@ -445,7 +455,9 @@ class AITerImpl(AttentionImpl):
     Implementation of attention using AITemplate.
     """
 
-    accepts_strided_qkv = True
+    @classmethod
+    def has_native_varlen_kernel(cls) -> bool:
+        return True
 
     def __init__(
         self,
@@ -490,6 +502,33 @@ class AITerImpl(AttentionImpl):
         support the current shapes, in which case the caller falls back to the
         (compilable) BF16 path.
         """
+        if USE_AITER_GFX1201:
+            if (
+                _aiter_fp8_quant_gfx1201 is None
+                or not self._can_use_flydsl_gfx1201(query, key, value)
+                or query.dtype != torch.bfloat16
+                # With BLOCK_N=32, D992 exceeds gfx1201's 64 KiB LDS.
+                or query.shape[-1] > 960
+            ):
+                return None
+            head_dim = query.shape[-1]
+            q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = _aiter_fp8_quant_gfx1201(
+                query,
+                key,
+                value,
+                # AITER's FWHT rotation requires a power-of-two head dimension.
+                rotation=head_dim & (head_dim - 1) == 0,
+            )
+            return _aiter_flash_attn_gfx1201(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+                q_descale=q_scale,
+                k_descale=k_scale,
+                v_descale=v_scale,
+            )
         if query.dtype != _fp8_dtype:
             q_fp8, q_scale = _per_tensor_quant_fp8(query)
             k_fp8, k_scale = _per_tensor_quant_fp8(key)
@@ -542,6 +581,7 @@ class AITerImpl(AttentionImpl):
         Performs attention using one of:
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
           - flash_attn_func (BF16, default or FP8 fallback for unsupported shapes)
+          - flydsl_flash_attn_func (gfx1201 BF16/FP16 or opt-in FP8)
 
         Args:
             query: Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
@@ -561,9 +601,30 @@ class AITerImpl(AttentionImpl):
             if output is not None:
                 return output
 
-        if USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
+        if USE_AITER_GFX1201 or USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
             return self._forward_bf16_eager(query, key, value)
         return self._forward_bf16(query, key, value)
+
+    def _can_use_flydsl_gfx1201(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> bool:
+        # Shared FMHA constraints; operand dtype and LDS limits differ between
+        # the BF16/FP16 consumer and the FP8 quantizer/consumer path below.
+        return (
+            USE_AITER_GFX1201
+            and _aiter_flash_attn_gfx1201 is not None
+            and query.dtype == key.dtype == value.dtype
+            and query.shape[-1] >= 64
+            and query.shape[-1] % 32 == 0
+            and query.shape[2:] == key.shape[2:] == value.shape[2:]
+            and (not self.causal or query.shape[1] == key.shape[1])
+            and self.dropout_p == 0.0
+            and 0.0 < self.softmax_scale < float("inf")
+            and not (
+                torch.is_grad_enabled()
+                and any(x.requires_grad for x in (query, key, value))
+            )
+        )
 
     def _forward_bf16(
         self,
@@ -572,6 +633,21 @@ class AITerImpl(AttentionImpl):
         value: torch.Tensor,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if (
+            # The FlyDSL kernel does not return the softmax LSE.
+            not return_lse
+            and self._can_use_flydsl_gfx1201(query, key, value)
+            and query.dtype in (torch.bfloat16, torch.float16)
+            # With BLOCK_N=32, D512 exceeds gfx1201's 64 KiB LDS.
+            and query.shape[-1] <= 480
+        ):
+            return _aiter_flash_attn_gfx1201(
+                query,
+                key,
+                value,
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+            )
         output = aiter.flash_attn_func(
             query,
             key,
@@ -580,6 +656,7 @@ class AITerImpl(AttentionImpl):
             causal=self.causal,
             return_attn_probs=False,
             return_lse=return_lse,
+            softmax_scale=self.softmax_scale,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return tuple(output[:2]) if return_lse else output
@@ -603,11 +680,14 @@ class AITerImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         used = None
         # gfx950 only: the batch kernels and the key split were measured there;
-        # other architectures keep the varlen kernel
-        if USE_AITER_GFX95 and cu_seqlens_host is not None:
+        # other architectures keep the varlen kernel. The batch kernels take
+        # the query bounds for the keys too, so separate key bounds skip them.
+        if USE_AITER_GFX95 and cu_seqlens_host is not None and cu_seqlens_k is None:
             if tuple(cu_seqlens_host) == (0, query.shape[0]):
                 used = query.shape[0]
             elif self.packed_trailing_padding:
@@ -650,14 +730,20 @@ class AITerImpl(AttentionImpl):
         attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        if cu_seqlens_k is None:
+            cu_seqlens_k = cu_seqlens
+        else:
+            cu_seqlens_k = cu_seqlens_k.to(
+                device=query.device, dtype=torch.int32
+            ).contiguous()
         output = attention_func(
             q=query.contiguous(),
             k=key.contiguous(),
             v=value.contiguous(),
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_k=max_seqlen if max_seqlen_k is None else max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,

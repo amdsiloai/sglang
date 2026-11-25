@@ -52,6 +52,12 @@ class AttentionBackend(ABC):
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
 
     @classmethod
+    def dense_fallback_backend(cls) -> "AttentionBackendEnum | None":
+        """The dense backend a sparse backend hands the layers it cannot serve,
+        such as cross attention, or None to leave them to the platform default."""
+        return None
+
+    @classmethod
     def supports_ring_rotation(cls) -> bool:
         """Whether this backend can serve as the ring-attention kernel; the
         per-hop online-softmax merge needs the kernel's softmax LSE."""
@@ -95,10 +101,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionImpl(ABC, Generic[T]):
-    # Whether forward() reads Q/K/V through explicit strides. False means the
-    # caller must hand it packed rows, so the Ulysses exchange has to copy its
-    # interleaved [.., 3 * head_size] output apart first.
-    accepts_strided_qkv: bool = False
+    @classmethod
+    def has_native_varlen_kernel(cls) -> bool:
+        """Whether the underlying kernel consumes ``cu_seqlens`` itself.
+
+        False means ``forward_varlen`` emulates segments by slicing and calling
+        fixed-length attention per segment, so callers that would repack to
+        reach it should keep their own masked path.
+        """
+        return False
 
     @abstractmethod
     def __init__(
@@ -174,6 +185,8 @@ class AttentionImpl(ABC, Generic[T]):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement packed varlen attention"

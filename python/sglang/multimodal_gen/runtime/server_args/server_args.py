@@ -97,6 +97,8 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
@@ -449,9 +451,6 @@ class ServerArgs(DisaggServerArgsMixin):
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
-    # Ordered "<layer-pattern>=<format>" rules routing named layers to a format
-    # other than --quantization. See runtime/layers/quantization/mixed_precision.
-    quantization_overrides: list[str] | None = None
 
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -579,6 +578,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # entries; a request executing longer turns /health unhealthy. Unset: off.
     request_time_limit: list[str] | None = None
     enable_metrics: bool = False
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -709,6 +711,9 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -724,6 +729,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
         if timeout is not None and (
@@ -2296,7 +2302,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{', '.join(sorted(missing_quantization))}"
             )
         self.component_quantization_ignored_layers = normalized_ignored_layers
-        self._normalize_quantization_overrides()
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -3108,13 +3113,15 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
+                "is supported for 'fp8', 'mxfp4', 'mxfp6', 'a6w4' and 'convrot_int8' "
+                "(ConvRot INT8 "
                 "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
                 "12.0 and 12.1, else on comfy_kitchen; see "
                 "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
-                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "Note: 'mxfp4', 'mxfp6' and 'a6w4' (MXFP6 activations by MXFP4 "
+                "weights) target ROCm + MI350+ (gfx95x); "
                 "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
@@ -3125,28 +3132,10 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "(fp8/mxfp4/mxfp6/a6w4/convrot_int8). Each pattern is matched against "
+                "the "
                 "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
-            ),
-        )
-        parser.add_argument(
-            "--quantization-overrides",
-            type=str,
-            nargs="+",
-            default=ServerArgs.quantization_overrides,
-            help=(
-                "Run named layers in a different online format than "
-                "--quantization selects, as '<layer-pattern>=<format>' entries. "
-                "A pattern without a glob character matches on dotted path "
-                "boundaries, like --quantization-ignored-layers; one holding "
-                "'*', '?' or '[' is matched as a glob against the whole layer "
-                "prefix. Entries are tried in order and the first match wins, "
-                "so a specific rule placed before a broader one overrides it. "
-                "Both sides must be online formats "
-                "(fp8/mxfp4/convrot_int8), since a pre-quantized checkpoint "
-                "fixes each tensor's format on disk. "
-                "Example: --quantization-overrides blocks.0=fp8 '*.ffn.fc_out=fp8'"
             ),
         )
 
@@ -3258,6 +3247,21 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.enable_metrics,
             help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
         )
         parser.add_argument(
             "--strict-ports",
@@ -3717,32 +3721,6 @@ class ServerArgs(DisaggServerArgsMixin):
             alias_suffix=None,
             expand_values=False,
         )
-
-    def _normalize_quantization_overrides(self) -> None:
-        from sglang.multimodal_gen.runtime.layers.quantization import (
-            ONLINE_QUANTIZATION_METHODS,
-        )
-
-        if not self.quantization_overrides:
-            self.quantization_overrides = None
-            return
-        entries = [entry.strip() for entry in self.quantization_overrides]
-        if not all(entries):
-            raise ValueError("--quantization-overrides entries cannot be empty")
-        if self.quantization is None:
-            raise ValueError(
-                "--quantization-overrides routes layers away from the format "
-                "--quantization selects, so --quantization must name an online "
-                "format: " + ", ".join(sorted(ONLINE_QUANTIZATION_METHODS))
-            )
-        if self.quantization not in ONLINE_QUANTIZATION_METHODS:
-            raise ValueError(
-                f"--quantization {self.quantization} reads a format fixed in the "
-                "checkpoint, so its layers cannot be routed by "
-                "--quantization-overrides; online formats are "
-                + ", ".join(sorted(ONLINE_QUANTIZATION_METHODS))
-            )
-        self.quantization_overrides = entries
 
     @staticmethod
     def _extract_component_quantization_ignored_layers(

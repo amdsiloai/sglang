@@ -34,8 +34,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
-    PRAXIS_DROID_CI_sampling_params,
-    PRAXIS_YAM_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
     SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
@@ -135,25 +133,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_perf_check=False,
         perf_warmup_requests=1,
         # No Diffusers counterpart to compare components against.
-        run_component_accuracy_check=False,
-        run_t2v_input_reference_check=False,
-    ),
-    # Action GT (consistency) files live in sgl-project/ci-data-diffusion and are not added yet.
-    DiffusionTestCase(
-        "praxis_droid_http",
-        DiffusionServerArgs(model_path="runwayml/praxis-1-droid-lerobot"),
-        PRAXIS_DROID_CI_sampling_params,
-        perf_warmup_requests=1,
-        run_consistency_check=False,
-        run_component_accuracy_check=False,
-        run_t2v_input_reference_check=False,
-    ),
-    DiffusionTestCase(
-        "praxis_yam_http",
-        DiffusionServerArgs(model_path="runwayml/praxis-1-yam-lerobot"),
-        PRAXIS_YAM_CI_sampling_params,
-        perf_warmup_requests=1,
-        run_consistency_check=False,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -1689,7 +1668,6 @@ STANDALONE_FILES = {
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
         "../single_test_file/test_cosmos3_action_sp_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
-        "../single_test_file/test_usp_strided_qkv_aiter_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
         "../unit/test_kandinsky6_sr_decode_parallel.py",
@@ -1787,8 +1765,6 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_cosmos3_action_sp_2_gpu.py": 60.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
-        # no model load; skipped outside ROCm, where it runs eight exchanges
-        "../single_test_file/test_usp_strided_qkv_aiter_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,

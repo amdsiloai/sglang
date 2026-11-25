@@ -572,29 +572,10 @@ def _can_use_packed_qkv_a2a_4d(
     )
 
 
-_PACKED_QKV_RECV_TURN = 0
-
-
-def _packed_qkv_recv_role(views_escape: bool) -> str:
-    """Staging role for the packed-QKV receive buffer.
-
-    Returning views into this buffer keeps it live past the collective, so
-    that path alternates between two buffers: the next block's exchange
-    writes the other one while attention still reads this one.
-    """
-    if not views_escape:
-        return "usp_packed_qkv_recv"
-    global _PACKED_QKV_RECV_TURN
-    _PACKED_QKV_RECV_TURN ^= 1
-    return f"usp_packed_qkv_recv_{_PACKED_QKV_RECV_TURN}"
-
-
 def _usp_input_all_to_all_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    *,
-    allow_strided_qkv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ulysses input exchange for Q/K/V with heads at dim=2.
 
@@ -604,10 +585,6 @@ def _usp_input_all_to_all_qkv(
     bit-identical to the unpacked path, which stays as the fallback for
     ineligible inputs (CPU, GQA-mismatched shapes, layouts whose row view
     would copy).
-
-    ``allow_strided_qkv`` returns the three interleaved views as they land,
-    for consumers that read Q/K/V through explicit strides
-    (``AttentionImpl.accepts_strided_qkv``); the default copies them apart.
     Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
     """
     world_size = get_ulysses_parallel_world_size()
@@ -637,9 +614,7 @@ def _usp_input_all_to_all_qkv(
             "usp_packed_qkv_src", (world_size, rows, h_local, 3 * d), q.dtype, q.device
         ),
     )
-    packed = _usp_all_to_all_single(
-        packed, role=_packed_qkv_recv_role(allow_strided_qkv)
-    )
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
     if b == 1:
         # Received chunks are already sequence-major: rank j's rows arrive at
         # offset j * s_local, so flattening the leading dims is a free view.
@@ -652,10 +627,51 @@ def _usp_input_all_to_all_qkv(
             .view(b, world_size * s_local, h_local, 3 * d)
         )
     q, k, v = packed.split(d, dim=-1)
-    if allow_strided_qkv:
-        return q, k, v
     # Copy out before the staging buffer is recycled by the next collective.
     return q.contiguous(), k.contiguous(), v.contiguous()
+
+
+def _usp_input_all_to_all_qkv_behind_prefix(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packed Ulysses input exchange that writes K/V right after a local prefix.
+
+    q/k/v: [1, s_local, h, d]; k_prefix/v_prefix: [1, p, h_local, d], already
+    sliced to this rank's heads. Returns q [1, s_global, h_local, d] and K/V
+    [1, p + s_global, h_local, d], equal to concatenating the prefix in front
+    of the gathered K/V. Callers check ``_can_use_packed_qkv_a2a_4d`` first.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    _, s_local, h_global, d = q.shape
+    h_local = h_global // world_size
+    packed = pack_qkv_destination_major(
+        q.view(s_local, h_global, d),
+        k.view(s_local, h_global, d),
+        v.view(s_local, h_global, d),
+        world_size,
+        out=_a2a_staging_buffer(
+            "usp_packed_qkv_src",
+            (world_size, s_local, h_local, 3 * d),
+            q.dtype,
+            q.device,
+        ),
+    )
+    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = packed.view(1, world_size * s_local, h_local, 3 * d)
+    q_out = packed[..., :d].contiguous()
+    prefix = k_prefix.shape[1]
+    kv_shape = (1, prefix + world_size * s_local, h_local, d)
+    k_out = q.new_empty(kv_shape)
+    v_out = q.new_empty(kv_shape)
+    k_out[:, :prefix].copy_(k_prefix)
+    v_out[:, :prefix].copy_(v_prefix)
+    k_out[:, prefix:].copy_(packed[..., d : 2 * d])
+    v_out[:, prefix:].copy_(packed[..., 2 * d :])
+    return q_out, k_out, v_out
 
 
 def _usp_input_all_to_all_varlen(
