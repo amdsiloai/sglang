@@ -128,6 +128,37 @@ def test_fa3_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
     assert calls[0]["cu_seqlens_q"] is cu_seqlens
 
 
+@pytest.mark.parametrize("graph_env", ["0", "1"])
+def test_aiter_seqlens_from_vit_cuda_graph_list(monkeypatch, graph_env):
+    # The graph runner passes [cu_seqlens, max_seqlen] so replay does no host
+    # sync; tensor callers keep working with the graph env var set.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", graph_env)
+    monkeypatch.setattr(vision, "_is_hip", True)
+    calls = []
+
+    def fake_flash_attn_varlen_func(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter",
+        SimpleNamespace(flash_attn_varlen_func=fake_flash_attn_varlen_func),
+    )
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    backend = vision.VisionAiterAttention()
+
+    backend(q, q, q, cu_seqlens=[cu_seqlens, 4], bsz=1, seq_len=6)
+    backend(q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6)
+
+    for kwargs in calls:
+        assert torch.equal(kwargs["cu_seqlens_q"], cu_seqlens)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+    assert calls[0]["max_seqlen_q"] == 4
+
+
 def test_triton_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
     # Same contract for the Triton backend: the list form (with its output
     # workspace) comes only from a graph runner, tensors take the eager path.
