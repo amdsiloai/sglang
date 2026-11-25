@@ -28,12 +28,10 @@ from sglang.srt.utils import (
     get_device,
     is_cuda,
     is_gfx1250_supported,
-    is_hip,
     is_npu,
 )
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter_rope_gfx1250 = _use_aiter and is_gfx1250_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -389,8 +387,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self._aiter_cos_sin = None
         if _use_aiter_rope_gfx1250 and not self._force_native:
             self._forward_method = self._forward_aiter_cached
-        elif _is_hip:
-            self._forward_method = self.forward_native
 
     def set_lerope_alpha(self, lerope_alpha: torch.Tensor) -> None:
         """Update in place so existing cache references see the LeRoPE frequencies."""
