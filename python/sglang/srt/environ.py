@@ -734,6 +734,10 @@ class Envs:
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
     # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # Prefill the part of a long prompt that does not fill a whole chunk first,
+    # then whole chunks, so the short chunk's attention sees almost no context
+    # instead of the whole prompt. See PrefillAdder.remainder_first_len.
+    SGLANG_CHUNKED_PREFILL_REMAINDER_FIRST = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
