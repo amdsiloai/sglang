@@ -1147,6 +1147,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1256,14 +1259,6 @@ class Envs:
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
-    # --enable-aiter-mega-moe-tp: the largest eager extend forward (in tokens) that
-    # takes the kernel; larger forwards keep the stock MoE path. Sets the kernel's
-    # per-rank capacity, ceil(max tokens / TP size).
-    SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS = EnvInt(4096)
-    # Dtype of the data the kernel's ranks exchange. fp8 (default) is lossy: it adds
-    # quantization error beyond the stock bf16 all-reduce. bf16 keeps that data in
-    # bf16; the output can still differ from the stock path's (its own sum order).
-    SGLANG_AITER_MEGA_MOE_TP_COMM_DTYPE = EnvStr("fp8")
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:

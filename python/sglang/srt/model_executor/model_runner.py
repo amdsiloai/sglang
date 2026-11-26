@@ -98,7 +98,6 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe import aiter_mega_moe_tp
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.offloader import (
     create_offloader,
@@ -221,6 +220,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_forward,
     get_global_dwdp_manager,
     get_lora,
     get_memory,
@@ -1534,10 +1534,6 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
-        # Not part of the helper above: it returns early for a model without a
-        # precompile hook, and the encoder server calls it too.
-        if not self.is_draft_worker:
-            aiter_mega_moe_tp.finalize(self.model)
 
     def _uses_cpu_graph_attention_backend(self) -> bool:
         return (
@@ -1677,6 +1673,7 @@ class ModelRunner:
                 ),
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
+                model_config=getattr(self, "model_config", None),
             )
         )
 
@@ -1960,6 +1957,7 @@ class ModelRunner:
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            get_forward().scoped(forward_batch=forward_batch),
         ):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
