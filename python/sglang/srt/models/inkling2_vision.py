@@ -4,8 +4,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.runtime_context import get_platform
-
 
 @torch.compile(dynamic=True, fullgraph=True)
 def _renormalize(x, mean, std):
@@ -73,8 +71,6 @@ class Inkling2VisionAttention(nn.Module):
         self.k_proj = nn.Linear(width, width, dtype=torch.bfloat16)
         self.v_proj = nn.Linear(width, width, dtype=torch.bfloat16)
         self.out_proj = nn.Linear(width, width, dtype=torch.bfloat16)
-        # FA4 varlen is CUDA-only; ROCm takes the per-image SDPA path.
-        self.fa4 = not get_platform().is_hip
 
     def forward(self, hidden, positions, lengths, cu_seqlens):
         shape = (-1, self.num_heads, self.head_dim)
@@ -83,12 +79,12 @@ class Inkling2VisionAttention(nn.Module):
             for projection in (self.q_proj, self.k_proj, self.v_proj)
         )
         q, k = _rotary(q, k, positions)
-        if hidden.is_cuda and self.fa4:
+        if hidden.is_cuda:
             from sglang.kernels.ops.attention.flash_attn.cute import (
                 flash_attn_varlen_func,
             )
 
-            if torch.cuda.get_device_capability(hidden.device)[0] not in (9, 10):
+            if torch.cuda.get_device_capability(hidden.device)[0] not in (9, 10, 12):
                 raise ValueError(
                     "Inkling2 vision attention requires Hopper or Blackwell"
                 )

@@ -1151,6 +1151,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
+    # Keep opt-in until the fixed dependency is qualified in the default CI image.
+    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1496,11 +1499,6 @@ class Envs:
     # Triton and Torch compilation
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
-    # Triton decode attention: each request takes cdiv(kv_len, N) KV splits, bounded by
-    # one wave of programs per batch and SGLANG_TRITON_DECODE_SPLIT_MAX splits (0 keeps
-    # the default heuristic).
-    SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS = EnvInt(0)
-    SGLANG_TRITON_DECODE_SPLIT_MAX = EnvInt(64)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
     # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
     # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
@@ -2139,12 +2137,20 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # ROCm gfx950, pure TP: each rank keeps 1/tp of a prefill's tokens through the
+    # replicated per-token work; attention heads and experts stay TP-sharded.
+    SGLANG_DSV4_TOKEN_PARALLEL_PREFILL = EnvBool(False)
+    # ... only for extend batches of at least this many tokens.
+    SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS = EnvInt(2048)
     # Decoder SWA bounded replay: eager prefill steps with up to this many tail rows
     # run the tail layers from CUDA graphs (buckets of 128 rows); 0 keeps them eager.
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = EnvInt(2048)
     # Prefill-graph shapes of at least this many tokens run the tail from the tail
     # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
+    # Warm up token-parallel prefill at server start (the first large batch pays
+    # one-time kernel and config builds otherwise); 0 skips it.
+    SGLANG_DSV4_TOKEN_PARALLEL_WARMUP = EnvBool(True)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for
@@ -2388,11 +2394,6 @@ class Envs:
     # Decode and MTP verify attention all-reduce through the push all-reduce
     # (rank-order FP32 sum) instead of the multimem one-shot.
     SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
-    # Inkling2 on ROCm keeps exact all-reduces; the image's quantized quick reduce
-    # (ROCM_QUICK_REDUCE_QUANTIZATION) applies only with this set.
-    SGLANG_INKLING2_ALLOW_QUICK_REDUCE = EnvBool(False)
-    # Inkling2 on ROCm is validated on gfx950 only; this lets other ROCm GPUs try it.
-    SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM = EnvBool(False)
     # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
     # the FP32 token sums.
     SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
