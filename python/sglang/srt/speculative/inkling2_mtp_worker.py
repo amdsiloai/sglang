@@ -3,7 +3,7 @@ import itertools
 import torch
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_disagg, get_platform
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.utils.device import async_h2d
@@ -63,14 +63,11 @@ class Inkling2MTPWorker(DSparkWorkerV2):
     def init_attention_backends(self):
         super().init_attention_backends()
         draft_runner = self.draft_model_runner
-        backend, name = (
-            ("triton", "Triton") if get_platform().is_hip else ("fa4", "FA4")
-        )
         if (
-            draft_runner.prefill_attention_backend_str != backend
-            or draft_runner.decode_attention_backend_str != backend
+            draft_runner.prefill_attention_backend_str != "fa4"
+            or draft_runner.decode_attention_backend_str != "fa4"
         ):
-            raise ValueError(f"Inkling2 MTP requires {name} draft attention")
+            raise ValueError("Inkling2 MTP requires FA4 draft attention")
         draft_pool = draft_runner.token_to_kv_pool
         if isinstance(draft_pool, SWAKVPool):
             draft_window = draft_runner.sliding_window_size + 1
