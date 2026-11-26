@@ -36,6 +36,7 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
+_CUDA_OR_HIP = frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP})
 _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 
 # ---------------------------------------------------------------------------
@@ -274,6 +275,24 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.layernorm_modulate",
+        KernelBackend.TRITON,
+        "norm.gated_residual_layernorm_modulate_triton:layernorm_modulate",
+        _HIP,
+    ),
+    (
+        "diffusion.gated_residual_layernorm_modulate",
+        KernelBackend.TRITON,
+        "norm.gated_residual_layernorm_modulate_triton:gated_residual_layernorm_modulate",
+        _HIP,
+    ),
+    (
+        "diffusion.residual_gate_add",
+        KernelBackend.TRITON,
+        "norm.gated_residual_layernorm_modulate_triton:gated_residual_add",
+        _HIP,
+    ),
+    (
         "diffusion.residual_gate_add",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.residual_gate_add_jit:residual_gate_add",
@@ -457,7 +476,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.complex_rope",
         KernelBackend.TRITON,
         "rope.complex_rope_triton:fused_complex_rope",
-        _CUDA,
+        _CUDA_OR_HIP,
     ),
     (
         "diffusion.hunyuan_qkv_rope_pack",
@@ -545,9 +564,21 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.channel_rmsnorm_silu_nhwc",
+        KernelBackend.TRITON,
+        "norm.vae_channel_norm_triton:channel_rmsnorm_silu_nhwc_triton",
+        _HIP,
+    ),
+    (
+        "diffusion.channel_rmsnorm_silu_nhwc",
         KernelBackend.JIT,
         "norm.channel_rmsnorm_silu_nhwc_jit:channel_rmsnorm_silu_nhwc",
         _CUDA,
+    ),
+    (
+        "diffusion.bias_residual_add",
+        KernelBackend.TRITON,
+        "norm.vae_channel_norm_triton:bias_residual_add_triton",
+        _HIP,
     ),
     (
         "diffusion.bias_residual_add",
@@ -685,7 +716,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.nearest_upsample_nhwc",
         KernelBackend.TRITON,
         "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
-        _CUDA,
+        frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     ),
     (
         "diffusion.flux2_token_cat_nvfp4",
@@ -726,9 +757,9 @@ _EXPORTS: dict[str, str] = {
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
     "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
-    "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
     "can_use_fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "can_use_fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
+    "flydsl_norm_supports": "norm.fused_residual_norm_flydsl",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
@@ -766,6 +797,10 @@ _EXPORTS: dict[str, str] = {
     "channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
     "is_channels_last_dense": "norm.channel_rmsnorm_silu_nhwc_jit",
     "bias_residual_add": "norm.bias_residual_add_jit",
+    "bias_residual_add_triton": "norm.vae_channel_norm_triton",
+    "can_use_bias_residual_add_triton": "norm.vae_channel_norm_triton",
+    "can_use_channel_rmsnorm_silu_nhwc_triton": "norm.vae_channel_norm_triton",
+    "channel_rmsnorm_silu_nhwc_triton": "norm.vae_channel_norm_triton",
     "can_use_bias_residual_add": "norm.bias_residual_add_jit",
     "can_use_fused_rmsnorm_modulation": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
@@ -866,6 +901,10 @@ _EXPORTS: dict[str, str] = {
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     "fused_complex_rope": "rope.complex_rope_triton",
+    "can_use_gated_residual_layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
+    "gated_residual_add": "norm.gated_residual_layernorm_modulate_triton",
+    "gated_residual_layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
+    "layernorm_modulate": "norm.gated_residual_layernorm_modulate_triton",
     "can_use_qknorm_complex_rope_cuda": "rope.qknorm_complex_rope_jit",
     "qknorm_complex_rope_cuda": "rope.qknorm_complex_rope_jit",
     "qknorm_complex_rope_pack_": "rope.qknorm_complex_rope_jit",
