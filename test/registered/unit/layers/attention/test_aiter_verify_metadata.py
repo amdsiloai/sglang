@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
@@ -62,7 +63,7 @@ def _unified_verify_backend():
     backend.use_muse_attention_paths = False
     backend.muse_reuse_verify_lengths = False
     backend.page_size = 1
-    backend.max_context_len = 128
+    backend.req_to_token_pool = SimpleNamespace(row_width=128)
     backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ
     backend.qo_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
     backend.kv_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
@@ -70,7 +71,7 @@ def _unified_verify_backend():
     backend.cuda_graph_kv_last_page_len = torch.zeros(_BATCH_SIZE, dtype=torch.int32)
     backend.req_to_token = torch.zeros((_BATCH_SIZE, 128), dtype=torch.int32)
     backend.cuda_graph_page_table = torch.zeros(
-        (_BATCH_SIZE, backend.max_context_len), dtype=torch.int32
+        (_BATCH_SIZE, backend.req_to_token_pool.row_width), dtype=torch.int32
     )
 
     def build_verify_unified_metadata(
@@ -161,7 +162,7 @@ def _dcp_verify_backend(asm_cprr):
     backend.dcp_world_size = _DCP_SIZE
     backend.num_draft_tokens = _DRAFT_TOKENS
     backend.cprr_kernel_heads = 96 if asm_cprr else 0
-    backend.max_context_len = _DCP_MAX_CONTEXT_LEN
+    backend.req_to_token_pool = SimpleNamespace(row_width=_DCP_MAX_CONTEXT_LEN)
     backend.max_split_per_batch = 32
     backend.cprr_fast_mode = True
     backend.cprr_intra_batch_mode = False
@@ -260,9 +261,11 @@ class _MHAPool:
         return torch.empty(1, 1, 8, 128)
 
 
-def _init_mha_backend(kv_cache_layout):
+def _init_mha_backend(kv_cache_layout, *, physical_write_loc=False):
     pool = _MHAPool(kv_cache_layout)
+    pool.requires_physical_write_loc = physical_write_loc
     model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(),
         dtype=torch.bfloat16,
         is_multimodal=False,
         num_attention_heads=32,
@@ -275,7 +278,9 @@ def _init_mha_backend(kv_cache_layout):
         model_config=model_config,
         device=torch.device("cpu"),
         kv_cache_dtype=torch.bfloat16,
-        req_to_token_pool=SimpleNamespace(req_to_token=None, size=_BATCH_SIZE),
+        req_to_token_pool=SimpleNamespace(
+            row_width=4096, req_to_token=None, size=_BATCH_SIZE
+        ),
         runner_ids=None,
         token_to_kv_pool=pool,
         is_draft_worker=False,
@@ -303,12 +308,74 @@ class TestAiterDecodeWorkspace(CustomTestCase):
     """Only paged_attention_ragged reads workspace_buffer; a SHUFFLE 5D pool decodes
     through pa_decode_gluon, so it must not allocate it."""
 
+    def test_static_pool_is_unaffected_by_arena_opt_in(self):
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(enabled),
+                envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(False),
+            ):
+                backend = _init_mha_backend("nhd")
+                self.assertFalse(backend.use_unified_memory)
+                self.assertFalse(backend.use_triton_unified_attention)
+
+    def test_arena_constructor_requires_explicit_opt_in(self):
+        with (
+            envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(False),
+            self.assertRaisesRegex(
+                RuntimeError, "SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1"
+            ),
+        ):
+            _init_mha_backend("nhd", physical_write_loc=True)
+
     def test_allocated_only_for_paged_ragged_decode(self):
         allocated = {
             layout: "workspace_buffer" in vars(_init_mha_backend(layout))
             for layout in ("nhd", "vectorized_5d")
         }
         self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
+
+
+class TestAiterArenaPageTables(CustomTestCase):
+    def test_prefill_preserves_full_and_window_physical_page_ids(self):
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import ReadTable
+
+        plan = object()
+        full = torch.tensor([[91, 73, 85], [37, 45, 0]], dtype=torch.int32)
+        window = torch.tensor([[0, 11, 19], [13, 27, 0]], dtype=torch.int32)
+        calls = []
+
+        def read_table(actual_plan, *, kind=IdSpaceKind.FULL, rows):
+            self.assertIs(actual_plan, plan)
+            self.assertEqual(rows, 2)
+            calls.append(kind)
+            ids = full if kind == IdSpaceKind.FULL else window
+            return ReadTable(
+                ids=ids,
+                row_ids=torch.arange(2),
+                row_stride=ids.stride(0),
+                entry_page_size=16,
+                is_translated=True,
+            )
+
+        backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+        backend.use_unified_memory = True
+        backend.use_sliding_window_kv_pool = True
+        backend.page_size = 16
+        backend.runner_ids = SimpleNamespace(read_table=read_table)
+        actual_full, actual_window = backend._build_extend_unified_page_table(
+            2,
+            torch.tensor([33, 17]),
+            torch.tensor([5, 2]),
+            33,
+            plan=plan,
+        )
+        # These are page IDs in batch order already, including a retired window
+        # page. Sampling every 16th entry or dividing the IDs again is incorrect.
+        self.assertIs(actual_full, full)
+        self.assertIs(actual_window, window)
+        self.assertEqual(calls, [IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW])
 
 
 if __name__ == "__main__":
