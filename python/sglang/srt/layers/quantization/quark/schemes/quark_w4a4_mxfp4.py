@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import direct_register_custom_op
-from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -94,6 +94,57 @@ def _asm_fp4_prequantized_input(
     return x_q.view(torch.float4_e2m1fn_x2), _shuffle_asm_fp4_act_scale(x_scales)
 
 
+# gemm_a4w4 computes whole 256-row N tiles; a partial tile is what made the
+# N=96 rows wrong (see _ASM_FP4_UNSAFE_MAX_N).
+_ASM_FP4_PACK_ROW_MULTIPLE = 256
+
+
+def pack_asm_fp4_weight_tail(
+    asm_weight: torch.Tensor,
+    asm_scale: torch.Tensor,
+    tail_weight: torch.Tensor,
+    tail_scale: torch.Tensor,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Append a row-major MXFP4 projection to one already in ASM layout.
+
+    Returns the packed (weight, scale) for one gemm_a4w4, or None when the two
+    do not pack. The tail is padded to whole 256-row tiles with zero weights
+    and E8M0 1.0 scales, then shuffled and swizzled like
+    process_weights_after_loading. The weight shuffle is local to 16 rows and
+    the scale swizzle to 32, so the leading rows keep their layout and output.
+    """
+    if not (
+        asm_weight.dim() == tail_weight.dim() == 2
+        and asm_scale.dim() == tail_scale.dim() == 2
+        and asm_weight.dtype == tail_weight.dtype
+        and asm_scale.dtype == tail_scale.dtype
+        and asm_weight.shape[1] == tail_weight.shape[1]
+        and asm_scale.shape[1] == tail_scale.shape[1]
+        and asm_weight.shape[0] == asm_scale.shape[0]
+        and tail_weight.shape[0] == tail_scale.shape[0]
+        and asm_weight.shape[0] % _ASM_FP4_PACK_ROW_MULTIPLE == 0
+    ):
+        return None
+    rows = tail_weight.shape[0]
+    padded_rows = (
+        (rows + _ASM_FP4_PACK_ROW_MULTIPLE - 1)
+        // _ASM_FP4_PACK_ROW_MULTIPLE
+        * _ASM_FP4_PACK_ROW_MULTIPLE
+    )
+    weight = tail_weight.new_zeros((padded_rows, tail_weight.shape[1]))
+    weight[:rows].copy_(tail_weight)
+    scale = tail_scale.new_full(
+        (padded_rows, tail_scale.shape[1]), _E8M0_ONE, dtype=torch.uint8
+    ).view(tail_scale.dtype)
+    scale[:rows].copy_(tail_scale)
+    if not _asm_fp4_scale_swizzle_supported(scale):
+        return None
+    return (
+        torch.cat([asm_weight, shuffle_weight(weight, layout=(16, 16))]),
+        torch.cat([asm_scale, _swizzle_asm_fp4_scale(scale)]),
+    )
+
+
 # On GPUs that lack the fp4-activation WMMA scale instruction
 # (V_WMMA_SCALE_F32_32X16X128_F4, e.g. gfx1250) the a4w4 (fp4 x fp4) linear GEMM
 # cannot run. aiter.fused_moe runs the MoE as a8w4 there (AITER_FORCE_A8W4, which
@@ -101,8 +152,16 @@ def _asm_fp4_prequantized_input(
 # plain nn.Linear on this arch, so the (few) MXFP4-quantized linear layers
 # dequantize their FP4 weights to bf16 once at load and run a plain bf16 GEMM.
 # This trades a little memory for correctness on hardware that cannot execute
-# the fp4 kernel at all.
-_dequant_linear_to_bf16 = is_gfx1250_supported()
+# the fp4 kernel at all. Checked per device: a node can mix architectures.
+def _dequant_linear_to_bf16(device: Optional[torch.device] = None) -> bool:
+    """Whether MXFP4 linears on ``device`` run as bf16. A weight parked on the
+    CPU (offload) or no device means the worker's current GPU."""
+    if not _is_hip:
+        return False
+    if device is None or device.type != "cuda":
+        device = torch.device("cuda", torch.cuda.current_device())
+    return "gfx1250" in torch.cuda.get_device_properties(device).gcnArchName
+
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [
@@ -403,7 +462,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
 
-        if _dequant_linear_to_bf16:
+        if _dequant_linear_to_bf16(layer.weight.device):
             w_bf16 = _dequant_mxfp4_to_bf16(layer.weight.data, layer.weight_scale.data)
             layer.weight = torch.nn.Parameter(w_bf16, requires_grad=False)
             # FP4 block scales are folded into the bf16 weight; drop them.

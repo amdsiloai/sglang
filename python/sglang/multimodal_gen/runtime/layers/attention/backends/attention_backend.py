@@ -52,6 +52,12 @@ class AttentionBackend(ABC):
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
 
     @classmethod
+    def dense_fallback_backend(cls) -> "AttentionBackendEnum | None":
+        """The dense backend a sparse backend hands the layers it cannot serve,
+        such as cross attention, or None to leave them to the platform default."""
+        return None
+
+    @classmethod
     def supports_ring_rotation(cls) -> bool:
         """Whether this backend can serve as the ring-attention kernel; the
         per-hop online-softmax merge needs the kernel's softmax LSE."""
@@ -95,6 +101,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionImpl(ABC, Generic[T]):
+    # Whether forward() reads Q/K/V through explicit strides. False means the
+    # caller must hand it packed rows, so the Ulysses exchange has to copy its
+    # interleaved [.., 3 * head_size] output apart first.
+    accepts_strided_qkv: bool = False
+
     @abstractmethod
     def __init__(
         self,

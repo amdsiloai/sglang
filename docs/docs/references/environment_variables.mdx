@@ -1960,6 +1960,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_MOE_STAGE2_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quark MXFP4 MoE on gfx95: call AITER's <code>fused_moe</code> with <code>stage2_fp8=True</code> in every MoE layer except a speculative draft's. AITER then writes FP8 per-route outputs and sums them in fp32 where the tuned stage 2 allows it (a FlyDSL reduce, or an MXFP4 scatter after an MXMOE stage 1). Not bitwise equal to the default. Needs an AITER whose <code>fused_moe</code> takes <code>stage2_fp8</code>; AITER's <code>AITER_FLYDSL_STAGE2_FP8=1</code> also changes the draft.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_FUSE_RMSNORM_PAD</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the residual-add + RMSNorm + zero-pad triplet before the MoE block via the AITER Triton kernel (TP=1, post-attention layernorm path only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1993,6 +1998,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HACK_FLASHMLA_BACKEND</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 HIP decode attention kernel: <code>auto</code> takes aiter's gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere; <code>aiter_sparse</code>, <code>tilelang</code>, <code>triton</code>, <code>torch</code>, <code>comparison</code> or <code>unified_kv_triton</code> force one.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_OPUS_FP8_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4.1 on gfx950, with <code>SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=1</code>: run the OPUS sparse prefill on the FP8 KV cache rows (AITER's FP8 OPUS kernel) instead of a BF16 copy of them. Applies to layers with the V4 cache layout and at most 32 local heads; other layers keep the BF16 kernel. Needs an AITER build with <code>pa_sparse_prefill_fp8_opus</code>; without it the BF16 kernel runs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code></td>

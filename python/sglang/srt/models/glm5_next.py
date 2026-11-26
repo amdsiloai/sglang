@@ -120,8 +120,10 @@ from sglang.srt.models.glm_ocr import (
 )
 from sglang.srt.models.utils import WeightsMapper, bind_or_assign
 from sglang.srt.multimodal.mm_utils import (
+    hip_dp_encoder_batches_vit,
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
+    warm_up_vision_tower,
 )
 from sglang.srt.runtime_context import (
     get_forward,
@@ -1577,10 +1579,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 )
             parallel = get_parallel()
             if (
-                parallel.tp_size not in (4, 8)
+                parallel.tp_size not in (2, 4, 8)
                 or parallel.moe_tp_size != parallel.tp_size
             ):
-                return "HIP shared experts fusion is validated only for TP4 and TP8."
+                return (
+                    "HIP shared experts fusion is validated only for TP2, TP4 and TP8."
+                )
             if (
                 getattr(text_config, "model_type", None) != "glm5_next_text"
                 or getattr(text_config, "hidden_size", None) != 4096
@@ -1740,6 +1744,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model.dflash_capture = True
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def precompile_kernels_after_loading(self) -> None:
+        # Under the batched DP encoder every rank's first ViT call would otherwise
+        # compile swiglu_clamped inside the first image burst. The first grid
+        # compiles its 3-D (blocks) and 2-D (merger) calls; the second grid's new
+        # size recompiles the 3-D call with a dynamic shape.
+        if self.visual is not None and hip_dp_encoder_batches_vit():
+            warm_up_vision_tower(self.visual, ([[1, 32, 32]], [[1, 48, 64]]))
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)

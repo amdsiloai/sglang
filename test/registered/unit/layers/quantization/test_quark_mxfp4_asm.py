@@ -118,7 +118,7 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
             mock.patch.object(fp4_utils, "is_hip", return_value=is_hip),
             mock.patch.object(fp4_utils, "is_mxfp4_gemm_supported", return_value=mxfp4),
         ):
-            initialize_fp4_gemm_config()
+            initialize_fp4_gemm_config(gpu_id=0)
         return fp4_utils.get_fp4_gemm_runner_backend()
 
     def test_rocm_auto(self):
@@ -139,11 +139,114 @@ class TestInitializeFp4GemmConfig(CustomTestCase):
                 backend = self._initialize("auto", is_hip=True)
         self.assertEqual(backend, Fp4GemmRunnerBackend.AITER)
 
+    def test_mxfp4_support_checks_the_worker_gpu(self):
+        # gfx942 at index 0, gfx950 at index 1: a worker on GPU 1 must see
+        # MXFP4 support even though device 0 lacks it.
+        archs = {0: "gfx942:sramecc+:xnack-", 1: "gfx950:sramecc+:xnack-"}
+        with (
+            mock.patch.object(fp4_utils, "is_hip", return_value=True),
+            mock.patch.object(
+                fp4_utils.torch.cuda,
+                "get_device_properties",
+                side_effect=lambda i: SimpleNamespace(gcnArchName=archs[i]),
+            ),
+            mock.patch.object(fp4_utils.torch.cuda, "current_device", return_value=1),
+        ):
+            self.assertFalse(fp4_utils.is_mxfp4_gemm_supported(0))
+            self.assertTrue(fp4_utils.is_mxfp4_gemm_supported(1))
+            self.assertTrue(fp4_utils.is_mxfp4_gemm_supported())
+
+    def test_initialize_uses_the_published_gpu_id(self):
+        exec_ctx = SimpleNamespace(
+            kernel=SimpleNamespace(fp4_gemm_runner_backend="aiter")
+        )
+        with (
+            mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
+            mock.patch.object(
+                fp4_utils, "get_device", return_value=SimpleNamespace(gpu_id=1)
+            ),
+            mock.patch.object(fp4_utils, "is_hip", return_value=True),
+            mock.patch.object(
+                fp4_utils, "is_mxfp4_gemm_supported", side_effect=lambda i: i == 1
+            ) as supported,
+        ):
+            initialize_fp4_gemm_config()
+        supported.assert_called_once_with(1)
+        self.assertEqual(
+            fp4_utils.get_fp4_gemm_runner_backend(), Fp4GemmRunnerBackend.AITER
+        )
+
+    def test_reject_rocm_only_backend_off_rocm(self):
+        # The CUDA encoder path calls this instead of initializing the backend.
+        for backend, should_raise in (
+            ("aiter", True),
+            ("triton", True),
+            ("auto", False),
+        ):
+            exec_ctx = SimpleNamespace(
+                kernel=SimpleNamespace(fp4_gemm_runner_backend=backend)
+            )
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
+                mock.patch.object(fp4_utils, "is_hip", return_value=False),
+            ):
+                if should_raise:
+                    with self.assertRaisesRegex(ValueError, "only supported on ROCm"):
+                        fp4_utils.reject_rocm_only_fp4_gemm_backend()
+                else:
+                    fp4_utils.reject_rocm_only_fp4_gemm_backend()
+
     def test_rocm_only_backends_rejected_off_rocm(self):
         for backend in ("aiter", "triton"):
             with self.subTest(backend=backend):
                 with self.assertRaisesRegex(ValueError, "only supported on ROCm"):
                     self._initialize(backend, is_hip=False)
+
+
+class TestQuarkMxfp4Gfx1250Fallback(CustomTestCase):
+    def test_bf16_fallback_checks_the_layer_device(self):
+        # gfx1250 at index 0, gfx950 at index 1: only the gfx1250 device
+        # dequantizes to bf16; a gfx950 layer keeps its MXFP4 weights.
+        archs = {0: "gfx1250", 1: "gfx950:sramecc+:xnack-"}
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4.torch.cuda,
+                "get_device_properties",
+                side_effect=lambda d: SimpleNamespace(gcnArchName=archs[d.index]),
+            ),
+        ):
+            self.assertTrue(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cuda", 0))
+            )
+            self.assertFalse(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cuda", 1))
+            )
+
+    def test_bf16_fallback_uses_the_worker_gpu_for_offloaded_weights(self):
+        # A weight parked on the CPU (offload) is checked against the GPU the
+        # worker executes on, not skipped.
+        archs = {0: "gfx950:sramecc+:xnack-", 1: "gfx1250"}
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4.torch.cuda,
+                "get_device_properties",
+                side_effect=lambda d: SimpleNamespace(gcnArchName=archs[d.index]),
+            ),
+            mock.patch.object(
+                quark_w4a4_mxfp4.torch.cuda, "current_device", return_value=1
+            ),
+        ):
+            self.assertTrue(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu"))
+            )
+            self.assertTrue(quark_w4a4_mxfp4._dequant_linear_to_bf16())
+        with mock.patch.object(quark_w4a4_mxfp4, "_is_hip", False):
+            self.assertFalse(
+                quark_w4a4_mxfp4._dequant_linear_to_bf16(torch.device("cpu"))
+            )
 
 
 class TestQuarkMxfp4BackendSelection(CustomTestCase):
@@ -332,6 +435,9 @@ class TestQuarkMxfp4AiterLayerSelection(CustomTestCase):
         with (
             mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
             mock.patch.object(
+                quark_w4a4_mxfp4, "_dequant_linear_to_bf16", return_value=False
+            ),
+            mock.patch.object(
                 quark_w4a4_mxfp4,
                 "shuffle_weight",
                 side_effect=lambda w, layout: w.clone(),
@@ -374,6 +480,127 @@ class TestQuarkMxfp4DynamicQuantFake(CustomTestCase):
         self.assertEqual(tuple(x_fp4.shape), (m, n // 2))
         self.assertEqual(tuple(scale.shape), (m, n // 32))
         self.assertEqual(scale.stride(), (1, m))
+
+
+def _shuffle_weight_ref(x: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
+    """AITER shuffle_weight for uint8 (fp4x2) weights, layout (16, 16)."""
+    assert layout == (16, 16)
+    n, k = x.shape
+    return (
+        x.view(1, n // 16, 16, k // 32, 2, 16)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .view(n, k)
+    )
+
+
+def _unshuffle_weight(x: torch.Tensor) -> torch.Tensor:
+    n, k = x.shape
+    return x.view(n // 16, k // 32, 2, 16, 16).permute(0, 3, 1, 2, 4).reshape(n, k)
+
+
+def _unswizzle_scale(scale: torch.Tensor) -> torch.Tensor:
+    rows, cols = scale.shape
+    return (
+        scale.view(torch.uint8)
+        .view(rows // 32, cols // 8, 4, 16, 2, 2, 1)
+        .permute(0, 5, 3, 1, 4, 2, 6)
+        .reshape(rows, cols)
+    )
+
+
+_FP4_LUT = torch.tensor(quark_w4a4_mxfp4._MXFP4_VALUES, dtype=torch.float64)
+
+
+def _dequant(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Row-major fp4x2 codes and E8M0 scales to float64, exactly."""
+    rows, k_packed = codes.shape
+    vals = torch.empty(rows, k_packed * 2, dtype=torch.float64)
+    vals[:, 0::2] = _FP4_LUT[(codes & 0xF).long()]
+    vals[:, 1::2] = _FP4_LUT[(codes >> 4).long()]
+    scale = torch.exp2(scale.view(torch.uint8).to(torch.float64) - 127.0)
+    return (vals.view(rows, -1, 32) * scale.unsqueeze(-1)).view(rows, -1)
+
+
+def _asm_gemm_ref(x_q, x_scales, weight, weight_scale) -> torch.Tensor:
+    """gemm_a4w4(bpreshuffle=True) semantics: shuffled weight, swizzled scales.
+    Products and sums of these dyadic values are exact in float64, so the
+    result does not depend on the accumulation order."""
+    m = x_q.shape[0]
+    x = _dequant(x_q, _unswizzle_scale(x_scales)[:m])
+    w = _dequant(_unshuffle_weight(weight), _unswizzle_scale(weight_scale))
+    return x @ w.t()
+
+
+class TestQuarkMxfp4AsmPackedTail(CustomTestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            quark_w4a4_mxfp4, "shuffle_weight", _shuffle_weight_ref, create=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _rand_proj(n, k, gen):
+        weight = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, generator=gen)
+        scale = torch.randint(120, 134, (n, k // 32), dtype=torch.uint8, generator=gen)
+        return weight, scale
+
+    def test_packed_rows_match_separate_gemms(self):
+        """Qwen3.8 GDN in_proj packing: qkvz in ASM layout + in_proj_ba (N=96,
+        raw layout) as a zero-padded tail. The shuffle is local to 16 rows and
+        the swizzle to 32, so one GEMM over the packed buffer must reproduce
+        both separate GEMMs exactly, and the padding rows must read zero."""
+        gen = torch.Generator().manual_seed(0)
+        k, n_qkvz, n_ba, m = 256, 512, 96, 5
+        qkvz_w, qkvz_s = self._rand_proj(n_qkvz, k, gen)
+        ba_w, ba_s = self._rand_proj(n_ba, k, gen)
+        # process_weights_after_loading for the ASM layer.
+        qkvz_w_asm = _shuffle_weight_ref(qkvz_w)
+        qkvz_s_asm = _swizzle_asm_fp4_scale(qkvz_s)
+
+        packed = quark_w4a4_mxfp4.pack_asm_fp4_weight_tail(
+            qkvz_w_asm, qkvz_s_asm, ba_w, ba_s
+        )
+        self.assertIsNotNone(packed)
+        weight, scale = packed
+        self.assertEqual(tuple(weight.shape), (n_qkvz + 256, k // 2))
+        self.assertEqual(tuple(scale.shape), (n_qkvz + 256, k // 32))
+        torch.testing.assert_close(weight[:n_qkvz], qkvz_w_asm, rtol=0, atol=0)
+        torch.testing.assert_close(scale[:n_qkvz], qkvz_s_asm, rtol=0, atol=0)
+
+        x_q, x_s = self._rand_proj(m, k, gen)
+        x_s_asm = _shuffle_asm_fp4_act_scale(x_s)
+        out = _asm_gemm_ref(x_q, x_s_asm, weight, scale)
+        x = _dequant(x_q, x_s)
+        torch.testing.assert_close(
+            out[:, :n_qkvz], x @ _dequant(qkvz_w, qkvz_s).t(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            out[:, n_qkvz : n_qkvz + n_ba],
+            x @ _dequant(ba_w, ba_s).t(),
+            rtol=0,
+            atol=0,
+        )
+        self.assertTrue(bool((out[:, n_qkvz + n_ba :] == 0).all()))
+
+    def test_unpackable_projections_are_rejected(self):
+        """Packing must fall back (None) rather than build a buffer whose
+        leading rows are not whole ASM tiles or whose K differs."""
+        gen = torch.Generator().manual_seed(1)
+        k = 256
+        ba_w, ba_s = self._rand_proj(96, k, gen)
+        pack = quark_w4a4_mxfp4.pack_asm_fp4_weight_tail
+        # Leading rows not a multiple of 256 (whole gemm_a4w4 N tiles).
+        w, s = self._rand_proj(288, k, gen)
+        self.assertIsNone(pack(w, s, ba_w, ba_s))
+        # K mismatch.
+        w, s = self._rand_proj(256, 2 * k, gen)
+        self.assertIsNone(pack(w, s, ba_w, ba_s))
+        # K/32 not a multiple of 8: the scale swizzle does not apply.
+        w, s = self._rand_proj(256, 128, gen)
+        tail_w, tail_s = self._rand_proj(96, 128, gen)
+        self.assertIsNone(pack(w, s, tail_w, tail_s))
 
 
 if __name__ == "__main__":
