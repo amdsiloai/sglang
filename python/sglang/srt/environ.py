@@ -1231,8 +1231,8 @@ class Envs:
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
-    # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
-    # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
+    # Deprecated: use --fp4-gemm-backend aiter|triton. Honored with a
+    # DeprecationWarning only while --fp4-gemm-backend is auto (see fp4_utils).
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
@@ -1242,6 +1242,9 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Rotate those projections by a 32-wide block Hadamard matrix before MXFP4.
+    # Needs hadamard_rotate on per_1x32_f4_quant_hip (ROCm/aiter#6734).
+    SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD = EnvBool(True)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
