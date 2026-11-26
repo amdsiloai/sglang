@@ -35,8 +35,8 @@ import fork_sync as fs  # noqa: E402
 git = fs.git
 
 
-def experimental_order(prs, deps, known):
-    """PR order of experimental/dev (or dev), exactly as fork_sync.main builds it."""
+def build_orders(prs, deps, known):
+    """(testing, unstable) PR orders, exactly as fork_sync.main builds them."""
     groups, generic = {}, []
     for num in sorted(prs):
         c = fs.classify(prs[num])
@@ -51,8 +51,8 @@ def experimental_order(prs, deps, known):
 
     model_nums = sorted({n for nums in groups.values() for n in nums})
     dev = reviewed(generic) + reviewed(model_nums)
-    experimental = dev + [n for n in generic if n not in dev] + [n for n in model_nums if n not in dev]
-    return fs.with_deps(dev, deps), fs.with_deps(experimental, deps)
+    unstable = dev + [n for n in generic if n not in dev] + [n for n in model_nums if n not in dev]
+    return fs.with_deps(dev, deps), fs.with_deps(unstable, deps)
 
 
 def names(a, b):
@@ -192,8 +192,8 @@ def pair_check(a, b, main):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--set", choices=("experimental", "stable"), default="experimental",
-                    help="experimental: the whole PR subset (experimental/dev); stable: approved only (dev)")
+    ap.add_argument("--set", choices=("unstable", "testing"), default="unstable",
+                    help="unstable: every open PR in the subset; testing: approved PRs only")
     ap.add_argument("--out", default="fork-conflicts", help="output prefix; writes <out>.md and <out>.json")
     ap.add_argument("--workdir", default="/tmp/fork-conflicts-worktree")
     args = ap.parse_args()
@@ -209,8 +209,8 @@ def main():
     prs, drafts = fs.load_open_prs()
     deps, extra = fs.resolve_stacks(prs, {**drafts, **prs})
     known = {**drafts, **extra, **prs}
-    stable, experimental = experimental_order(prs, deps, known)
-    order = experimental if args.set == "experimental" else stable
+    testing, unstable = build_orders(prs, deps, known)
+    order = unstable if args.set == "unstable" else testing
     in_set = set(order)
     deps = {n: m for n, m in deps.items() if n in in_set}
     fork_only = {n for n, pr in known.items() if pr.get("fork_only")}

@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Rebuild stable and experimental branches
+      - name: Rebuild dev, testing and per-model dev branches
         env:
           FORK_TEAM_LOGINS: ${{ secrets.FORK_TEAM_LOGINS }}
           GH_TOKEN: ${{ github.token }}
@@ -38,7 +38,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_REPO: sgl-project/sglang
           FORK_REPO: amdsiloai/sglang
-        run: python3 scripts/fork_conflicts.py --set experimental --out fork-conflicts
+        run: python3 scripts/fork_conflicts.py --set unstable --out fork-conflicts
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Weekday rebuild of stable and experimental fork branches.
+"""Weekday rebuild of the fork's algorithmic branches.
+
+Pushes stripy/dev (every open team PR that applies cleanly, in order) and
+stripy/<model>/dev (approved team PRs for one model). Also builds
+stripy/testing (approved team PRs) and stripy/unstable (every open team PR)
+without pushing them: those two are merged by the conflict resolver, which
+reads their conflict lists from branch-build.json.
 
 Reads logins from FORK_TEAM_LOGINS (one per line). Never prints them.
-Does not resolve conflicts and does not build unstable branches.
 
 Per-repo settings come from FORK_SYNC_CONFIG (default
 scripts/fork_sync_config.json). Without that file the sglang defaults apply.
@@ -27,7 +32,7 @@ FORK_REMOTE = os.environ.get("FORK_REMOTE", "origin")
 FORK_MAIN = "refs/remotes/forksync/main"
 TOOLING = (".github/workflows/fork-sync.yml", "scripts/fork_sync.py", "scripts/fork_conflicts.py", CONFIG_PATH)
 PREFIX = "stripy/"
-TAG_RE = re.compile(r"^stripy/(?:experimental/|unstable/)?([a-z0-9.]+)-(\d{8})$")
+TAG_RE = re.compile(r"^stripy/(?:[a-z0-9.]+/)*[a-z0-9.]+-(\d{8})$")
 DRY_RUN = os.environ.get("FORK_SYNC_DRY_RUN") == "1"
 
 # Longer / more specific patterns first.
@@ -554,7 +559,7 @@ def prune_tags(today):
         m = TAG_RE.fullmatch(tag)
         if not m:
             continue
-        day = dt.datetime.strptime(m.group(2), "%Y%m%d").date()
+        day = dt.datetime.strptime(m.group(1), "%Y%m%d").date()
         age = (today - day).days
         if day.weekday() == 0:
             limit = 26 * 7
@@ -619,7 +624,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today, 
     lines = [
         f"# Branch build {today.isoformat()}",
         "",
-        f"Upstream `{UPSTREAM_REPO}` main `{upstream[:12]}`. Open pull requests only. Conflicts were recorded and not resolved. No unstable branch was built.",
+        f"Upstream `{UPSTREAM_REPO}` main `{upstream[:12]}`. Open pull requests only. Conflicts were recorded and not resolved. stripy/testing and stripy/unstable are built for the agentic merge and not pushed.",
         "",
         "## Contained",
         "",
@@ -750,38 +755,30 @@ def main():
     # One copy of each model PR, in PR number order. A PR that matches several models is still listed once.
     model_nums = sorted({n for nums in groups.values() for n in nums})
     approved_models = reviewed(model_nums)
-    # dev is every approved PR that applies. experimental/dev is that stack, then the open PRs that are not approved.
+    # dev_prs is every approved PR that applies; all_open adds the open PRs that are not approved.
     dev_prs = approved_generic + approved_models
-    experimental_dev = dev_prs + [n for n in generic if n not in dev_prs] + [n for n in model_nums if n not in dev_prs]
-    plan = [(f"{PREFIX}dev", with_deps(dev_prs, deps), None),
-            (f"{PREFIX}experimental/dev", with_deps(experimental_dev, deps), f"{PREFIX}dev")]
+    all_open = dev_prs + [n for n in generic if n not in dev_prs] + [n for n in model_nums if n not in dev_prs]
+    # (branch, PR list, pushed?). testing and unstable are inputs to the conflict resolver, so they are built only.
+    plan = [(f"{PREFIX}dev", with_deps(all_open, deps), True),
+            (f"{PREFIX}testing", with_deps(dev_prs, deps), False),
+            (f"{PREFIX}unstable", with_deps(all_open, deps), False)]
     for model, nums in sorted(groups.items()):
         approved_model = reviewed(nums)
-        name = f"{PREFIX}{model}"
         if approved_model:
-            plan.append((name, with_deps(approved_generic + approved_model, deps), None))
-        plan.append((f"{PREFIX}experimental/{model}", with_deps(generic + nums, deps), name))
+            plan.append((f"{PREFIX}{model}/dev", with_deps(approved_generic + approved_model, deps), True))
     results = []
-    trees = {}
-    twins_dropped = []
     built_all = []
-    for name, nums, base in plan:
+    for name, nums, pushed in plan:
         print(f"building {name} ({len(nums)} prs)", flush=True)
         result = build(name, nums, upstream, deps)
         result["prs"] = list(nums)
+        result["pushed"] = pushed
         built_all.append(result)
         landed = sum(1 for x in result["landed"] if x["status"] == "landed")
         conflicts = len(result["skipped"])
         print(f"built {name} {result['sha'][:12]} landed={landed} conflicts={conflicts}", flush=True)
-        tree = git("rev-parse", f"{result['sha']}^{{tree}}").stdout.strip()
-        if base and trees.get(base) == tree:
-            twins_dropped.append(name)
-            continue
-        trees[name] = tree
-        results.append(result)
-    for name in twins_dropped:
-        if not DRY_RUN:
-            subprocess.run(["git", "push", FORK_REMOTE, f":refs/heads/{name}"], capture_output=True, text=True)
+        if pushed:
+            results.append(result)
     contained = sorted({x["pr"] for b in results for x in b["landed"] if x["status"] == "contained"})
     stamp = today.strftime("%Y%m%d")
     unpushed = {}
