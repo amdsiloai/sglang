@@ -1,130 +1,474 @@
-"""Allreduce algorithm auto-tuner for sglang auto_tune.
+"""All-reduce tuner: time every all-reduce kernel at each message size, keep the fastest.
 
-Benchmarks and selects the optimal allreduce backend for a given
-model and TP configuration.
+The server dispatches all-reduces in two stages, and so does the tuner:
 
-Supported backends:
-- custom_allreduce: sglang's own all-reduce, or AITER's when --use-aiter-allreduce is set. The ROCm server dispatches AITER.
-- custom_allreduce_v2: SGLang CustomAllReduceV2, with --use-car-v2. ROCm configs cover MI355 and Helios.
-- nccl: standard NCCL allreduce
-- torch_symm_mem: torch symmetric memory all-gather + reduce
-- quick_allreduce_<codec>: AMD QuickReduce. Default codec is INT4. With the default cast, the timed call converts bf16 to fp16 inside that kernel.
+- eager (default): each call is launched from Python, as prefill and other
+  calls outside a CUDA graph are. A custom all-reduce copies its input into
+  the registered staging buffer first, and that copy is part of the time.
+- graph (``--graph 1``): the calls are captured into a CUDA graph inside each
+  communicator's capture context, and the graph is replayed. A captured
+  custom all-reduce reads its input in place, with no copy, which is what a
+  decode replay runs.
 
-Part of #13363 item 4.
+The eager table goes in ``SGLANG_TUNED_EAGER_CONFIG`` and the graph table in
+``SGLANG_TUNED_GRAPH_CONFIG``.
+
+Which backends compete is whatever the SGLang and AITER source scans find
+that this tuner can construct. HIP QuickReduce and FlyDSL are included only
+when the requested quant is declared in AITER. The result table names each
+winner by its full class name.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import statistics
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypedDict,
+    Union,
+    cast,
+)
+
+from sglang.auto_tune.aiter_comms import (
+    DEFAULT_AITER_DIR,
+    DEFAULT_SGLANG_DIR,
+    OpenerSpec,
+    ScannedParams,
+    backend_plan,
+    format_scan,
+    scan_aiter,
+    scan_dirs,
+    scan_sglang,
+    short_name,
+    source_name,
+    unmatched_skips,
+)
+
+if TYPE_CHECKING:
+    import torch
+    from torch.cuda import CUDAGraph
+    from torch.distributed import ProcessGroup
+
+# Codecs the HIP QuickReduce opener can be asked to build. Whether one of
+# them competes is decided by the AITER scan, which names FP8 rather than INT8.
+QR_QUANT_REGIMES = ("FP", "INT8", "INT6", "INT4")
 
 logger = logging.getLogger(__name__)
 
-# Codecs QuickAllReduce reads from ROCM_QUICK_REDUCE_QUANTIZATION. NONE leaves
-# the communicator disabled, so it is not a benchmarkable backend.
-QR_QUANT_REGIMES = ("FP", "INT8", "INT6", "INT4")
 _QR_QUANT_ENVS = (
     "ROCM_QUICK_REDUCE_QUANTIZATION",
     "AITER_QUICK_REDUCE_QUANTIZATION",
 )
 
+MODES = ("eager", "graph")
+
+DEFAULT_NUM_WARMUP = 20
+
+# The kernels spin-wait on their peers, so a call only completes once every
+# rank runs it. Nothing inside a timing loop keeps the ranks together, so they
+# are brought back in step every this many calls or replays.
+_SYNC_EVERY = 10
+
+# One timed call. The return is the reduced tensor.
+StepFn = Callable[[], "torch.Tensor"]
+BarrierFn = Callable[[], None]
+CaptureFn = Callable[[], ContextManager[None]]
+CheckFn = Callable[["torch.Tensor"], Optional[str]]
+CallFn = Callable[["torch.Tensor"], Optional["torch.Tensor"]]
+
+
+class _ConfigDict(TypedDict):
+    """One winning row, as written into the JSON."""
+
+    size_bytes: int
+    backend: str
+    time_us: float
+    tp_size: int
+    dtype: str
+    method: str
+
+
+class _Measurement(TypedDict):
+    """Every backend's time at one message size. None means it was skipped."""
+
+    size_bytes: int
+    times_us: Dict[str, Optional[float]]
+
+
+class AllreduceTuneResult(TypedDict, total=False):
+    """The document ``run_allreduce_tuning`` writes. Empty when nothing won."""
+
+    mode: str
+    env: str
+    tp_size: int
+    qr_quant: str
+    qr_cast_bf16_to_fp16: int
+    fly_algorithm: str
+    num_warmups: int
+    ignore_acr_max_size: bool
+    ignore_scr_max_size: bool
+    num_iters: int
+    ingraph_calls: Optional[int]
+    skip: List[str]
+    scandirs: List[str]
+    timing: str
+    configs: List[_ConfigDict]
+    measurements: List[_Measurement]
+    path: str
+
+
+class ReadyParams(ScannedParams):
+    """Scan parameters plus the group this process will construct with."""
+
+    cpu_group: "ProcessGroup"
+    device: "torch.device"
+    algorithm: str
+
+
+class ReadySpec(TypedDict):
+    opener: str
+    params: ReadyParams
+
+
+class _Capturable(Protocol):
+    def capture(self) -> ContextManager[None]: ...
+
+
+class _Closeable(Protocol):
+    def close(self) -> None: ...
+
+
+class _SglangTopo(Protocol):
+    """SGLang custom all-reduce link check."""
+
+    world_size: int
+    full_nvlink: bool
+    use_amd_deterministic_impl: bool
+
+
+class _CustomProbe(Protocol):
+    max_size: int
+    world_size: int
+
+    def should_custom_ar(self, tensor: "torch.Tensor") -> bool: ...
+    def custom_all_reduce(self, tensor: "torch.Tensor") -> Optional["torch.Tensor"]: ...
+    def _all_reduce_impl(
+        self, tensor: "torch.Tensor", registered: bool = False
+    ) -> "torch.Tensor": ...
+    def all_reduce(
+        self, tensor: "torch.Tensor", registered_input: bool = False
+    ) -> "torch.Tensor": ...
+
+
+class _QuickComm(Protocol):
+    _SUPPORTED_DTYPES: Tuple["torch.dtype", ...]
+
+    def should_quick_allreduce(self, tensor: "torch.Tensor") -> bool: ...
+    def quick_all_reduce(self, tensor: "torch.Tensor") -> "torch.Tensor": ...
+
+
+class _FlyComm(Protocol):
+    device: "torch.device"
+
+    def preload(
+        self, *, payload_range: Optional[Tuple[int, int]] = None
+    ) -> None: ...
+    def compile(self, inp: "torch.Tensor", out: "torch.Tensor") -> None: ...
+    def allreduce(self, inp: "torch.Tensor", out: "torch.Tensor") -> None: ...
+
+
+class _OutplaceComm(Protocol):
+    def change_state(
+        self, enable: Optional[bool] = None
+    ) -> ContextManager[None]: ...
+    def outplace_all_reduce(
+        self, tensor: "torch.Tensor"
+    ) -> Optional["torch.Tensor"]: ...
+
+
+class _SymmComm(Protocol):
+    dtype: "torch.dtype"
+
+    def should_torch_symm_mem_allreduce(self, tensor: "torch.Tensor") -> bool: ...
+
+
+class _AllReduceCall(Protocol):
+    def all_reduce(self, tensor: "torch.Tensor") -> Optional["torch.Tensor"]: ...
+    def should_custom_ar(self, tensor: "torch.Tensor") -> bool: ...
+
+
+def _no_capture() -> ContextManager[None]:
+    return contextlib.nullcontext()
+
 
 @dataclasses.dataclass
 class AllreduceConfig:
-    """Best allreduce configuration for a given message size."""
+    """Fastest backend at one message size."""
 
     size_bytes: int
     backend: str
     time_us: float
     tp_size: int
     dtype: str = ""
+    # The collective this row timed. The server calls this name instead of
+    # guessing from the methods the class defines.
+    method: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+    def to_dict(self) -> "_ConfigDict":
+        return {
+            "size_bytes": self.size_bytes,
+            "backend": self.backend,
+            "time_us": self.time_us,
+            "tp_size": self.tp_size,
+            "dtype": self.dtype,
+            "method": self.method,
+        }
 
 
-def _get_tensor_sizes(model_config: Dict[str, Any]) -> List[int]:
-    """Derive key tensor sizes (in bytes) for allreduce operations.
+class _Rejected(Exception):
+    """The kernel will not run this tensor. The message is the log line."""
 
-    In transformer models, allreduce happens after:
-    - QKV projection (3 * hidden_size)
-    - Attention output (hidden_size)
-    - MLP gate + up (intermediate_size)
-    - MoE fused (shared_expert hidden_size)
+
+@dataclasses.dataclass
+class _Backend:
+    """One opened all-reduce.
+
+    ``check`` returns why the tensor cannot run, or None. ``call`` runs one
+    out-of-place all-reduce and returns its output. ``capture`` is entered
+    around a graph capture, the way ``GroupCoordinator.graph_capture`` enters
+    each communicator's ``capture()``.
     """
-    hidden_size = model_config["hidden_size"]
-    intermediate_size = model_config.get("shard_intermediate_size", 4 * hidden_size)
+
+    check: CheckFn
+    call: CallFn
+    close: Callable[[], None]
+    capture: CaptureFn = _no_capture
+    prepare: Optional[Callable[[List[int]], None]] = None
+    impl: str = ""
+    note: str = ""
+    method: str = ""
+
+
+def _normalize_sizes(sizes: List[int]) -> List[int]:
+    """The message sizes to time, in bytes. Each one is a bf16 tensor."""
+    cleaned = sorted({int(size) for size in sizes})
+    bad = [size for size in cleaned if size <= 0 or size % 2]
+    if not cleaned or bad:
+        raise ValueError(
+            "sizes must be positive multiples of 2 bytes, one bf16 tensor "
+            f"each. Rejected: {bad or 'none given'}"
+        )
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Timing
+# ---------------------------------------------------------------------------
+
+
+def _reclaim_size_cache(tries: int = 8) -> None:
+    """Give this size's cached blocks back to the driver.
+
+    Communicator workspaces stay allocated for the whole sweep, so this does
+    not wait for the device to read empty. It stops when ``empty_cache`` no
+    longer shrinks the cache, or after ``tries``.
+    """
+    import gc
 
     import torch
 
-    dtype = model_config.get("dtype", torch.bfloat16)
-    elem_size = 2  # default bf16/fp16
-    if dtype == torch.float32:
-        elem_size = 4
-    elif dtype == torch.float8_e4m3fn:
-        elem_size = 1
-
-    sizes = [
-        hidden_size * elem_size,           # attention output
-        3 * hidden_size * elem_size,       # QKV
-        intermediate_size * elem_size,     # MLP up
-        hidden_size * elem_size,           # MLP down (same as attn)
-    ]
-
-    sizes.extend([
-        4 * hidden_size * elem_size,       # typical fused
-        8 * hidden_size * elem_size,       # large fused
-        16 * hidden_size * elem_size,      # very large
-    ])
-
-    return sorted(set(sizes))
-
-
-def _time_gpu_calls(
-    invoke, num_iters: int, num_warmup: int, use_median: bool = False
-) -> Optional[float]:
-    """Time ``invoke`` on the GPU, in microseconds. ``None`` means not eligible.
-
-    The default is the mean of one timed loop. With ``use_median``, each call
-    gets its own events and the result is the median of those calls.
-    """
-    import torch
-
-    for _ in range(num_warmup):
-        if invoke() is None:
-            return None
+    gc.collect()
     torch.cuda.synchronize()
-    if not use_median:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(num_iters):
-            if invoke() is None:
-                return None
-        end.record()
+    previous: Optional[int] = None
+    for _ in range(tries):
+        torch.cuda.empty_cache()
+        reserved = torch.cuda.memory_reserved()
+        if reserved <= torch.cuda.memory_allocated() or reserved == previous:
+            return
+        previous = reserved
         torch.cuda.synchronize()
-        return start.elapsed_time(end) * 1000 / num_iters
 
+
+def _time_eager(
+    step: StepFn,
+    num_iters: int,
+    use_median: bool,
+    barrier: BarrierFn,
+    sync_every: int,
+    num_warmups: int = DEFAULT_NUM_WARMUP,
+) -> float:
+    """Microseconds per call, launched from Python one call at a time."""
+    import torch
+
+    for _ in range(num_warmups):
+        step()
+    barrier()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     for i in range(num_iters):
         starts[i].record()
-        if invoke() is None:
-            return None
+        step()
         ends[i].record()
+        # Each event pair spans one call, so re-syncing between calls stays
+        # out of the measurement.
+        if sync_every and (i + 1) % sync_every == 0:
+            barrier()
     torch.cuda.synchronize()
-    samples_us = [
-        starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
-    ]
-    return statistics.median(samples_us)
+    if use_median:
+        return statistics.median(
+            starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
+        )
+    else:
+        return statistics.mean(
+            starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
+        )
 
 
-def _agree(ok: bool, cpu_group: "torch.distributed.ProcessGroup") -> bool:
+def _replay(
+    graph: "CUDAGraph", count: int, barrier: BarrierFn, sync_every: int
+) -> None:
+    """Replay ``count`` times, letting the ranks drift at most a chunk apart."""
+    for i in range(count):
+        graph.replay()
+        if i + 1 == count or (sync_every and (i + 1) % sync_every == 0):
+            barrier()
+
+
+def _time_graph(
+    step: StepFn,
+    capture: CaptureFn,
+    num_iters: int,
+    ingraph_calls: int,
+    use_median: bool,
+    barrier: BarrierFn,
+    sync_every: int,
+    num_warmups: int = DEFAULT_NUM_WARMUP,
+) -> float:
+    """Microseconds per call, from replays of a graph that holds ``ingraph_calls`` calls.
+
+    The calls are recorded back to back, as consecutive layers' all-reduces
+    are in a decode graph. ``num_iters`` is the number of timed replays.
+
+    ``barrier`` brings every rank to the same point. It is called the same
+    number of times on every rank, so it cannot itself hang.
+    """
+    import torch
+
+    # Eager warm-up first: it builds kernels and workspaces outside the graph.
+    # Inside a capture context a non-captured call is a warm-up that returns
+    # zeros, so it would not exercise the kernel.
+    for _ in range(num_warmups):
+        step()
+    barrier()
+
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    # Exiting ``capture`` registers the captured inputs with the peers. That
+    # is a collective, so it runs after the capture ends, on every rank.
+    with capture():
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(ingraph_calls):
+                step()
+    # Registration only agreed on the peers' addresses, it did not wait for
+    # them. A rank that replays now hands its kernel an address a peer has yet
+    # to publish.
+    barrier()
+
+    _replay(graph, num_warmups, barrier, sync_every)
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    for i in range(num_iters):
+        starts[i].record()
+        graph.replay()
+        ends[i].record()
+        # Each event pair spans one replay, so re-syncing between replays
+        # stays out of the measurement.
+        if sync_every and (i + 1) % sync_every == 0:
+            barrier()
+    torch.cuda.synchronize()
+    samples = (
+        starts[i].elapsed_time(ends[i]) * 1000 / ingraph_calls for i in range(num_iters)
+    )
+    elapsed = statistics.median(samples) if use_median else statistics.mean(samples)
+    del graph
+    return elapsed
+
+
+def _time_backend(
+    backend: _Backend,
+    tensor: "torch.Tensor",
+    mode: str,
+    num_iters: int,
+    ingraph_calls: int,
+    use_median: bool,
+    barrier: BarrierFn,
+    sync_every: int,
+    num_warmups: int = DEFAULT_NUM_WARMUP,
+) -> float:
+    def step() -> "torch.Tensor":
+        out = backend.call(tensor)
+        if out is None:
+            raise _Rejected("the kernel declined the tensor")
+        return out
+
+    if mode == "graph":
+        return _time_graph(
+            step,
+            backend.capture,
+            num_iters,
+            ingraph_calls,
+            use_median,
+            barrier,
+            sync_every,
+            num_warmups,
+        )
+    return _time_eager(
+        step, num_iters, use_median, barrier, sync_every, num_warmups
+    )
+
+
+# ---------------------------------------------------------------------------
+# Opening backends
+# ---------------------------------------------------------------------------
+
+
+def _reason_from(exc: Exception, what: str) -> str:
+    """One line naming the exception, for the skipped column."""
+    text = str(exc).splitlines()[0] if str(exc) else ""
+    detail = f": {text}" if text else ""
+    return f"{what} raised {type(exc).__name__}{detail}"
+
+
+def _check_backend(backend: _Backend, tensor: "torch.Tensor") -> Optional[str]:
+    """Why the tensor cannot run, or None. A raising check counts as a reason.
+
+    A rank that raised here while the others went on into the collectives would
+    leave them waiting, so the exception becomes a reason like any other and is
+    then agreed across the ranks.
+    """
+    try:
+        return backend.check(tensor)
+    except Exception as e:
+        return _reason_from(e, "check")
+
+
+def _agree(ok: bool, cpu_group: "ProcessGroup") -> bool:
     """True only when every rank passes ``ok``.
 
     A rank that skips a backend while the others enter its collectives leaves
@@ -138,16 +482,10 @@ def _agree(ok: bool, cpu_group: "torch.distributed.ProcessGroup") -> bool:
     return bool(flag.item())
 
 
-class _Rejected(Exception):
-    """The kernel will not run this tensor. The message is the log line."""
-
-
-def _shape_reason(tensor, supported_dtypes) -> Optional[str]:
-    """Why this tensor's shape or dtype is not one the kernel can run.
-
-    Size caps are not a reason. A tensor that passes here is handed to the
-    kernel, which rejects it itself when the workspace cannot hold it.
-    """
+def _shape_reason(
+    tensor: "torch.Tensor", supported_dtypes: Sequence["torch.dtype"]
+) -> Optional[str]:
+    """Why this tensor's dtype or layout is not one the kernel can run."""
     if tensor.dtype not in supported_dtypes:
         return f"dtype {tensor.dtype} is not supported"
     nbytes = tensor.numel() * tensor.element_size()
@@ -162,341 +500,408 @@ def _shape_reason(tensor, supported_dtypes) -> Optional[str]:
     return None
 
 
-def _custom_topology_ok(car) -> bool:
-    from sglang.srt.utils import is_hip
-
-    if not is_hip():
-        return car.world_size == 2 or car.full_nvlink
-    if car.use_amd_deterministic_impl:
-        return True
-    return bool(car.full_nvlink)
-
-
-def _class_qualname(cls) -> str:
-    func = getattr(cls, "func", cls)
-    return (
-        f"{getattr(func, '__module__', '')}.{getattr(func, '__name__', type(func).__name__)}"
-    )
-
-
-def _relax_aiter_size_cap(car) -> str:
-    """Ignore AITER_CUSTOM_AR_MAX_SIZE. The registered pool still bounds the call.
-
-    The cutoff is read once, into ``_car_max_size``, when the communicator is
-    built. Raising that attribute is enough for a build that has it. An older
-    build bakes 64 MiB into ``should_custom_ar``; the wrapper below keeps the
-    other gates and compares against the pool instead.
-    """
-    pool = int(getattr(car, "max_size", 0) or 0)
-    if hasattr(car, "_car_max_size") and pool > 0:
-        car._car_max_size = pool
-        return f"AITER_CUSTOM_AR_MAX_SIZE ignored; cutoff is the {pool}B pool"
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-        is_weak_contiguous,
-    )
-
-    original = getattr(car, "should_custom_ar", None)
-    if original is None or pool <= 0:
-        return "AITER size cap left unchanged; this build has no cutoff to lift"
-
-    def should(inp, prefill_support=False):
-        if original(inp, prefill_support=prefill_support):
-            return True
-        if getattr(car, "disabled", True):
-            return False
-        nbytes = inp.numel() * inp.element_size()
-        if nbytes % 16 != 0 or nbytes > pool or not is_weak_contiguous(inp):
-            return False
-        if not (
-            getattr(car, "world_size", 0) == 2 or getattr(car, "fully_connected", False)
-        ):
-            return False
-        return True
-
-    car.should_custom_ar = should
-    return f"AITER policy cutoff bypassed; cutoff is the {pool}B pool"
-
-
-def _open_custom_allreduce(
-    cpu_group, device, ignore_max_size=False, use_aiter=False, ignore_acr_max_size=False
-):
-    """Build one custom all-reduce and time it under the name ``custom_allreduce``.
-
-    ``use_aiter`` asks for the class ``dispatch_custom_allreduce`` returns.
-    On ROCm that is AITER's communicator, which is the one the server runs
-    for a ``custom_allreduce`` row. The sglang class is a different kernel.
-    """
-    car = None
-    ok = False
-    try:
-        if use_aiter:
-            from aiter.dist.device_communicators.custom_all_reduce import (
-                CustomAllreduce as AiterCustomAllreduce,
-            )
-
-            opened = _class_qualname(AiterCustomAllreduce)
-            car = AiterCustomAllreduce(group=cpu_group, device=device)
-            ok = not getattr(car, "disabled", True)
-        else:
-            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-                CustomAllreduce,
-            )
-
-            opened = _class_qualname(CustomAllreduce)
-            car = CustomAllreduce(cpu_group, device)
-            ok = not car.disabled
-    except Exception as e:
-        opened = ""
-        logger.warning(
-            "custom_allreduce (%s) failed: %s",
-            "aiter" if use_aiter else "sglang",
-            e,
-        )
-    if not _agree(ok, cpu_group):
-        if car is not None and hasattr(car, "close"):
-            car.close()
-        return None
-
-    cap_note = ""
-    if use_aiter and ignore_acr_max_size:
-        cap_note = _relax_aiter_size_cap(car)
-
-    supported = getattr(car, "_SUPPORTED_DTYPES", None) or torch_float_dtypes()
-
-    def run(tensor, num_iters, num_warmup=20, use_median=False):
-        reason = _shape_reason(tensor, supported)
-        if reason:
-            raise _Rejected(reason)
-        # The sglang class has a topology gate the server also applies to it.
-        # AITER decides for itself inside should_custom_ar.
-        if not use_aiter and not _custom_topology_ok(car):
-            raise _Rejected("not supported on this link topology")
-        if ignore_max_size and hasattr(car, "_all_reduce_impl"):
-            # Past the published cap, the kernel rejects a tensor that does
-            # not fit the workspace. That rejection is the skip reason.
-            invoke = lambda: car._all_reduce_impl(tensor, registered=False)
-        else:
-            if hasattr(car, "should_custom_ar") and not car.should_custom_ar(tensor):
-                nbytes = tensor.numel() * tensor.element_size()
-                limit = getattr(car, "max_size", None)
-                extra = f" (workspace {limit}B)" if limit is not None else ""
-                raise _Rejected(f"{nbytes}B was declined by should_custom_ar{extra}")
-            invoke = lambda: car.custom_all_reduce(tensor)
-
-        def timed():
-            out = invoke()
-            if out is None:
-                raise _Rejected("custom all-reduce declined the tensor")
-            return out
-
-        return _time_gpu_calls(timed, num_iters, num_warmup, use_median=use_median)
-
-    run.impl = opened
-    run.note = cap_note
-    close = car.close if hasattr(car, "close") else (lambda: None)
-    return run, close
-
-
-def _open_car_v2(cpu_group, device):
-    """Time SGLang's CustomAllReduceV2.
-
-    On ROCm the server uses it only when SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1.
-    The class itself already carries the MI355 (gfx950) and Helios (gfx1250)
-    configs. A size its heuristic declines is skipped, the same way the server
-    would leave that size to the next backend.
-    """
-    car = None
-    ok = False
-    opened = ""
-    try:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
-        )
-
-        opened = _class_qualname(CustomAllReduceV2)
-        car = CustomAllReduceV2(group=cpu_group, device=device)
-        ok = not getattr(car, "disabled", True)
-    except Exception as e:
-        logger.warning("custom_allreduce_v2 failed: %s", e)
-    if not _agree(ok, cpu_group):
-        if car is not None and hasattr(car, "close"):
-            car.close()
-        return None
-
-    def run(tensor, num_iters, num_warmup=20, use_median=False):
-        if not car.should_custom_ar(tensor):
-            nbytes = tensor.numel() * tensor.element_size()
-            limit = getattr(car, "max_size", None)
-            extra = f" (workspace {limit}B)" if limit is not None else ""
-            raise _Rejected(f"{nbytes}B was declined by custom all-reduce v2{extra}")
-
-        def timed():
-            out = car.custom_all_reduce(tensor)
-            if out is None:
-                raise _Rejected("custom all-reduce v2 declined the tensor")
-            return out
-
-        return _time_gpu_calls(timed, num_iters, num_warmup, use_median=use_median)
-
-    run.impl = opened
-    return run, car.close if hasattr(car, "close") else (lambda: None)
-
-
-def torch_float_dtypes():
+def _float_dtypes() -> Tuple["torch.dtype", "torch.dtype", "torch.dtype"]:
     import torch
 
     return (torch.float32, torch.float16, torch.bfloat16)
 
 
-def _open_nccl_allreduce(group, cpu_group, device):
+def _custom_ar_call(
+    car: object, tensor: "torch.Tensor", past_cap: bool
+) -> Optional["torch.Tensor"]:
+    """One call, the way the server runs a custom all-reduce.
+
+    Inside the class's cap that is ``custom_all_reduce``: in a capture context
+    on a capturing stream it hands the kernel the input itself, otherwise it
+    copies the input into the staging buffer. Past the cap, a class with
+    ``_all_reduce_impl`` uses that, and a class with ``all_reduce`` uses that.
+    """
+    import torch
+
+    custom = cast(_CustomProbe, car)
+    if not past_cap:
+        return custom.custom_all_reduce(tensor)
+    capturing = bool(getattr(car, "_IS_CAPTURING", False)) and (
+        torch.cuda.is_current_stream_capturing()
+    )
+    if hasattr(car, "_all_reduce_impl"):
+        return custom._all_reduce_impl(
+            tensor, registered=capturing and not bool(getattr(car, "tms_cudagraph", False))
+        )
+    return custom.all_reduce(
+        tensor,
+        registered_input=capturing
+        and bool(getattr(car, "enable_register_for_capturing", False)),
+    )
+
+
+def _sglang_topology_ok(car: _SglangTopo) -> bool:
+    from sglang.srt.utils import is_hip
+
+    if not is_hip():
+        return car.world_size == 2 or car.full_nvlink
+    return bool(car.use_amd_deterministic_impl or car.full_nvlink)
+
+
+def _import_class(qualname: str) -> type:
+    """Import the class the scan named. The name is ``module.Class``."""
+    import importlib
+
+    module_name, _, class_name = qualname.rpartition(".")
+    if not module_name or not class_name:
+        raise ImportError(qualname)
+    return cast(type, getattr(importlib.import_module(module_name), class_name))
+
+
+def _constructor_parameters(cls: type) -> Dict[str, inspect.Parameter]:
+    """Parameters ``cls`` can be called with.
+
+    A subclass such as ``QuickAllReduceInt4`` only names ``algorithm`` and
+    ``min_bytes`` and forwards everything else through ``**kwargs`` to
+    ``FlyQuickAllReduce``. Those forwarded names are part of the call too.
+    """
+    merged: Dict[str, inspect.Parameter] = {}
+    accepts_var_keyword = False
+    for klass in cls.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            parameters = inspect.signature(init).parameters
+        except (TypeError, ValueError):
+            continue
+        var_keyword = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+        )
+        if klass is cls:
+            merged.update(parameters)
+            accepts_var_keyword = var_keyword
+            if not var_keyword:
+                break
+            continue
+        if not accepts_var_keyword:
+            break
+        for name, param in parameters.items():
+            if name in merged or param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            merged[name] = param
+        if not var_keyword:
+            break
+    return merged
+
+
+def _construct(
+    cls: type,
+    cpu_group: "ProcessGroup",
+    device: "torch.device",
+    algorithm: Optional[str] = None,
+) -> object:
+    """Build ``cls`` from the group, device, and FlyDSL schedule it asks for."""
     import torch.distributed as dist
 
-    def run(tensor, num_iters, num_warmup=20, use_median=False):
-        # dist.all_reduce returns None, which _time_gpu_calls would read as
-        # "not eligible", so report success explicitly.
-        def invoke():
-            dist.all_reduce(tensor, group=group)
-            return True
+    kwargs: Dict[str, Union["ProcessGroup", "torch.device", str, int, bool]] = {}
+    for name, param in _constructor_parameters(cls).items():
+        if name == "self" or param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if name in ("group", "cpu_group"):
+            kwargs[name] = cpu_group
+        elif name == "algorithm":
+            if algorithm is None:
+                if param.default is inspect.Parameter.empty:
+                    raise TypeError(f"{cls.__name__} requires {name}")
+            else:
+                kwargs[name] = algorithm
+        elif name == "device":
+            kwargs["device"] = device
+        elif name == "rank":
+            kwargs["rank"] = dist.get_rank(group=cpu_group)
+        elif name == "world_size":
+            kwargs["world_size"] = dist.get_world_size(group=cpu_group)
+        elif name == "enable_register_for_capturing":
+            from sglang.srt.environ import envs
 
-        return _time_gpu_calls(invoke, num_iters, num_warmup, use_median=use_median)
-
-    return run, None
-
-
-def _open_torch_symm_mem(group, cpu_group, device):
-    comm = None
-    ok = False
-    try:
-        from sglang.srt.distributed.device_communicators.torch_symm_mem import (
-            TorchSymmMemCommunicator,
-        )
-
-        comm = TorchSymmMemCommunicator(group, device)
-        ok = not comm.disabled
-    except Exception as e:
-        logger.warning("torch_symm_mem failed: %s", e)
-    if not _agree(ok, cpu_group):
-        return None
-
-    def run(tensor, num_iters, num_warmup=20, use_median=False):
-        if not comm.should_torch_symm_mem_allreduce(tensor):
-            raise _Rejected(_shape_reason(tensor, (comm.dtype,)) or "tensor was declined")
-        return _time_gpu_calls(
-            lambda: comm.all_reduce(tensor),
-            num_iters,
-            num_warmup,
-            use_median=use_median,
-        )
-
-    return run, None
-
-
-def _normalize_qr_quants(qr_quants: Optional[List[str]]) -> List[str]:
-    if qr_quants is None:
-        qr_quants = ["INT4"]
-    selected: List[str] = []
-    for quant in qr_quants:
-        if quant in QR_QUANT_REGIMES and quant not in selected:
-            selected.append(quant)
-    return selected
-
-
-def _set_qr_quant(quant: str) -> Dict[str, Optional[str]]:
-    previous = {name: os.environ.get(name) for name in _QR_QUANT_ENVS}
-    for name in _QR_QUANT_ENVS:
-        os.environ[name] = quant
-    return previous
-
-
-def _restore_qr_quant(previous: Dict[str, Optional[str]]) -> None:
-    for name, value in previous.items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
-
-
-def _open_quick_allreduce(
-    quant,
-    cpu_group,
-    device,
-    ignore_min_size=False,
-    ignore_max_size=False,
-    cast_bf16_to_fp16=True,
-):
-    """Build QuickReduce once at one codec. The codec is read at construction.
-
-    ``cast_bf16_to_fp16`` is ``ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16``. The
-    communicator reads it once and passes it into every ``qr_all_reduce``.
-    The cast is on the kernel's load and store, so the timed call includes it.
-    """
-    os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = (
-        "1" if cast_bf16_to_fp16 else "0"
-    )
-    previous = _set_qr_quant(quant)
-    qr = None
-    ok = False
-    try:
-        from sglang.srt.distributed.device_communicators.quick_all_reduce import (
-            QuickAllReduce,
-        )
-
-        qr = QuickAllReduce(cpu_group, device)
-        ok = not qr.disabled
-        if ok and bool(qr.use_fp16_kernels) != bool(cast_bf16_to_fp16):
-            logger.warning(
-                "quick_allreduce %s cast flag is %s, requested %s",
-                quant,
-                qr.use_fp16_kernels,
-                int(cast_bf16_to_fp16),
+            kwargs["enable_register_for_capturing"] = (
+                not envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
             )
-            ok = False
+        elif param.default is inspect.Parameter.empty:
+            raise TypeError(f"{cls.__name__} requires {name}")
+    return cls(**kwargs)
+
+
+def _close_comm(comm: object) -> None:
+    if comm is not None and hasattr(comm, "close"):
+        comm.close()
+
+
+# A quant-class allreduce accepts any contiguous bf16 payload up to this
+# window. The check lives here so a declined size is a skip, not an exception
+# in the timed loop.
+_FLYDSL_MAX_BYTES = 4 * 1024**3
+_FLYDSL_ALIGN = 16
+_FLYDSL_WARMUP_BYTES = 1024 * 1024
+
+
+def _open_scanned(
+    qualname: str,
+    methods: Sequence[str],
+    quant_suffix: str,
+    quant: str,
+    lift_cap: bool,
+    cast_bf16_to_fp16: bool,
+    algorithm: str,
+    cpu_group: "ProcessGroup",
+    device: "torch.device",
+) -> Optional[_Backend]:
+    """Open the class ``qualname`` and call the collective the scan saw on it."""
+    method_names = set(methods)
+    comm: Optional[object] = None
+    ok = False
+    previous: Optional[Dict[str, Optional[str]]] = None
+    try:
+        cls = _import_class(qualname)
+        if "quick_all_reduce" in method_names and not quant_suffix:
+            os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = (
+                "1" if cast_bf16_to_fp16 else "0"
+            )
+            previous = {name: os.environ.get(name) for name in _QR_QUANT_ENVS}
+            for name in _QR_QUANT_ENVS:
+                os.environ[name] = quant
+        comm = _construct(cls, cpu_group, device, algorithm=algorithm)
+        if quant_suffix and hasattr(comm, "compile"):
+            import torch
+
+            warmup = torch.empty(
+                _FLYDSL_WARMUP_BYTES // 2, dtype=torch.bfloat16, device=device
+            )
+            cast(_FlyComm, comm).compile(warmup, torch.empty_like(warmup))
+            torch.cuda.synchronize(device)
+        if "outplace_all_reduce" in method_names and "custom_all_reduce" not in method_names:
+            ok = bool(getattr(comm, "available", False))
+        else:
+            ok = not getattr(comm, "disabled", False)
     except Exception as e:
-        logger.warning("quick_allreduce %s failed: %s", quant, e)
+        logger.warning("%s failed: %s", qualname, e)
     finally:
-        _restore_qr_quant(previous)
-    if not _agree(ok, cpu_group):
-        if qr is not None:
-            qr.close()
+        if previous is not None:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+    if not _agree(ok, cpu_group) or comm is None:
+        _close_comm(comm)
+        return None
+    return _backend_for(comm, method_names, quant_suffix, lift_cap, qualname)
+
+
+def _backend_for(
+    comm: object,
+    methods: set[str],
+    quant_suffix: str,
+    lift_cap: bool,
+    qualname: str,
+) -> Optional[_Backend]:
+    """Check and call chosen from the methods the scan recorded."""
+    capture: CaptureFn = (
+        cast(_Capturable, comm).capture if hasattr(comm, "capture") else _no_capture
+    )
+    close: Callable[[], None] = (
+        cast(_Closeable, comm).close if hasattr(comm, "close") else (lambda: None)
+    )
+    if quant_suffix or (
+        "allreduce" in methods and "quick_all_reduce" not in methods
+    ):
+        return _quant_backend(comm, qualname, capture, close)
+    if "quick_all_reduce" in methods:
+        return _quick_backend(comm, qualname, capture, close)
+    if "custom_all_reduce" in methods:
+        return _custom_backend(comm, lift_cap, qualname, capture, close)
+    if "outplace_all_reduce" in methods:
+        outplace = cast(_OutplaceComm, comm)
+
+        def call_out(tensor: "torch.Tensor") -> Optional["torch.Tensor"]:
+            with outplace.change_state(enable=True):
+                return outplace.outplace_all_reduce(tensor)
+
+        return _Backend(
+            check=lambda tensor: None,
+            call=call_out,
+            close=close,
+            capture=capture,
+            impl=qualname,
+            method="outplace_all_reduce",
+        )
+    if "all_reduce" in methods:
+        return _all_reduce_backend(comm, qualname, capture, close)
+    _close_comm(comm)
+    return None
+
+
+def _custom_backend(
+    comm: object,
+    lift_cap: bool,
+    qualname: str,
+    capture: CaptureFn,
+    close: Callable[[], None],
+) -> _Backend:
+    has_past = hasattr(comm, "_all_reduce_impl") or hasattr(comm, "all_reduce")
+    if not has_past:
+        lift_cap = False
+    aiter_past = hasattr(comm, "all_reduce") and not hasattr(comm, "_all_reduce_impl")
+    supported = cast(
+        Sequence["torch.dtype"],
+        getattr(comm, "_SUPPORTED_DTYPES", None) or _float_dtypes(),
+    )
+    probe = cast(_CustomProbe, comm)
+    past_cap_limit = 0
+    if has_past:
+        past_cap_limit = int(probe.max_size) // 2 if aiter_past else int(probe.max_size)
+    past_cap: Dict[int, bool] = {}
+
+    def check(tensor: "torch.Tensor") -> Optional[str]:
+        if has_past:
+            reason = _shape_reason(tensor, supported)
+            if reason:
+                return reason
+            if not aiter_past and not _sglang_topology_ok(cast(_SglangTopo, comm)):
+                return "not supported on this link topology"
+        nbytes = tensor.numel() * tensor.element_size()
+        if probe.should_custom_ar(tensor):
+            past_cap[nbytes] = False
+            return None
+        if not lift_cap:
+            return f"{nbytes}B was declined by should_custom_ar"
+        if aiter_past and not (
+            probe.world_size == 2 or bool(getattr(comm, "fully_connected", False))
+        ):
+            return "not supported on this link topology"
+        if nbytes > past_cap_limit:
+            return f"{nbytes}B does not fit the {past_cap_limit}B buffer"
+        past_cap[nbytes] = True
         return None
 
-    def run(tensor, num_iters, num_warmup=20, use_median=False):
-        reason = _shape_reason(tensor, qr._SUPPORTED_DTYPES)
-        if reason:
-            raise _Rejected(reason)
-        import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+    def call(tensor: "torch.Tensor") -> Optional["torch.Tensor"]:
+        nbytes = tensor.numel() * tensor.element_size()
+        return _custom_ar_call(comm, tensor, past_cap.get(nbytes, False))
 
-        if not ops.qr_supports(qr._ptr, tensor.dtype):
-            raise _Rejected(f"this build does not support {tensor.dtype}")
-        if not ignore_min_size or not ignore_max_size:
-            if not qr.should_quick_allreduce(
-                tensor,
-                ignore_min_size=ignore_min_size,
-                ignore_max_size=ignore_max_size,
-            ):
-                nbytes = tensor.numel() * tensor.element_size()
-                raise _Rejected(f"{nbytes}B is outside the published size window")
-
-        def timed():
-            # use_fp16_kernels was fixed at init from
-            # ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16. quick_all_reduce passes it
-            # into the kernel, which casts bf16 to fp16 on load and back on
-            # store. That conversion is inside this timed call.
-            out = qr.quick_all_reduce(tensor)
-            if out is None:
-                raise _Rejected("QuickReduce declined the tensor")
-            return out
-
-        return _time_gpu_calls(timed, num_iters, num_warmup, use_median=use_median)
-
-    return run, qr.close
+    note = ""
+    if lift_cap:
+        note = f"cap lifted up to the {past_cap_limit}B buffer"
+    return _Backend(
+        check=check,
+        call=call,
+        close=close,
+        capture=capture,
+        impl=qualname,
+        note=note,
+        method="custom_all_reduce",
+    )
 
 
-def _cpu_group(group: "torch.distributed.ProcessGroup"):
-    """Custom all-reduce and QuickReduce reject an NCCL group.
+def _quick_backend(
+    comm: object, qualname: str, capture: CaptureFn, close: Callable[[], None]
+) -> _Backend:
+    quick = cast(_QuickComm, comm)
 
-    The server attaches both to a gloo group. torchrun's default group is NCCL.
-    """
+    def check(tensor: "torch.Tensor") -> Optional[str]:
+        if not quick.should_quick_allreduce(tensor):
+            reason = _shape_reason(tensor, quick._SUPPORTED_DTYPES)
+            nbytes = tensor.numel() * tensor.element_size()
+            return reason or f"{nbytes}B is outside the QuickReduce size window"
+        return None
+
+    return _Backend(
+        check=check,
+        call=quick.quick_all_reduce,
+        close=close,
+        capture=capture,
+        impl=qualname,
+        method="quick_all_reduce",
+    )
+
+
+def _quant_backend(
+    comm: object, qualname: str, capture: CaptureFn, close: Callable[[], None]
+) -> _Backend:
+    import torch
+
+    floor = int(getattr(comm, "min_bytes", 0))
+    fly = cast(_FlyComm, comm)
+
+    def prepare(sizes: List[int]) -> None:
+        if not hasattr(comm, "preload"):
+            return
+        usable = [int(size) for size in sizes if int(size) >= floor]
+        if not usable:
+            return
+        fly.preload(payload_range=(min(usable), max(usable)))
+        torch.cuda.synchronize(fly.device if hasattr(comm, "device") else None)
+
+    def check(tensor: "torch.Tensor") -> Optional[str]:
+        if tensor.dtype != torch.bfloat16:
+            return "quant allreduce supports bf16"
+        if not tensor.is_contiguous():
+            return "quant allreduce requires a contiguous tensor"
+        if tensor.data_ptr() % _FLYDSL_ALIGN:
+            return "quant allreduce requires 16-byte alignment"
+        nbytes = tensor.numel() * tensor.element_size()
+        if nbytes % _FLYDSL_ALIGN:
+            return f"{nbytes}B is not a multiple of {_FLYDSL_ALIGN}"
+        if nbytes < floor:
+            return f"{nbytes}B is below the {floor}B floor"
+        if nbytes > _FLYDSL_MAX_BYTES:
+            return f"{nbytes}B exceeds the 4GiB window"
+        return None
+
+    def call(tensor: "torch.Tensor") -> "torch.Tensor":
+        out = torch.empty_like(tensor)
+        fly.allreduce(tensor, out)
+        return out
+
+    return _Backend(
+        check=check,
+        call=call,
+        close=close,
+        capture=capture,
+        prepare=prepare,
+        impl=qualname,
+        method="allreduce",
+    )
+
+
+def _all_reduce_backend(
+    comm: object, qualname: str, capture: CaptureFn, close: Callable[[], None]
+) -> _Backend:
+    def check(tensor: "torch.Tensor") -> Optional[str]:
+        if hasattr(comm, "should_torch_symm_mem_allreduce"):
+            symm = cast(_SymmComm, comm)
+            if not symm.should_torch_symm_mem_allreduce(tensor):
+                return _shape_reason(tensor, (symm.dtype,)) or "tensor was declined"
+            return None
+        plain = cast(_AllReduceCall, comm)
+        if hasattr(comm, "should_custom_ar") and not plain.should_custom_ar(tensor):
+            nbytes = tensor.numel() * tensor.element_size()
+            return f"{nbytes}B was declined by should_custom_ar"
+        return None
+
+    return _Backend(
+        check=check,
+        call=cast(_AllReduceCall, comm).all_reduce,
+        close=close,
+        capture=capture,
+        impl=qualname,
+        method="all_reduce",
+    )
+
+
+def _cpu_group(group: "ProcessGroup") -> "ProcessGroup":
+    """Custom all-reduce, QuickReduce and PyNccl attach to a gloo group, as in the server."""
     import torch.distributed as dist
 
     if dist.get_backend(group) != dist.Backend.NCCL:
@@ -504,365 +909,404 @@ def _cpu_group(group: "torch.distributed.ProcessGroup"):
     return dist.new_group(backend="gloo")
 
 
+_OPENERS = {"scanned": _open_scanned}
+
+
 def _open_backends(
-    qr_quants: List[str],
-    group,
-    cpu_group,
-    device,
+    bound: Dict[str, ReadySpec],
     verbose: bool,
-    qr_ignore_min_size: bool = False,
-    qr_ignore_max_size: bool = False,
-    use_aiter_allreduce: bool = False,
-    qr_cast_bf16_to_fp16: bool = True,
-    use_car_v2: bool = False,
-    ignore_acr_max_size: bool = False,
-) -> Dict[str, Any]:
+) -> Dict[str, _Backend]:
     """Open every backend once, in the same order on every rank.
 
-    Returns name -> (run, close). Backends that cannot start are left out.
+    ``bound`` maps the table name to its opener and kwargs. Each torchrun
+    process is one GPU and calls this once; the ranks pass the same map, so
+    they open the same communicators.
     """
-    # All three custom all-reduces are separate entries. A flag does not
-    # drop the others: the run is a competition, and one winner is stored
-    # per size under that kernel's own name.
-    openers = [
-        (
-            "sglang_custom_allreduce",
-            lambda: _open_custom_allreduce(
-                cpu_group,
-                device,
-                ignore_max_size=qr_ignore_max_size,
-                use_aiter=False,
-            ),
-        ),
-        (
-            "aiter_custom_allreduce",
-            lambda: _open_custom_allreduce(
-                cpu_group,
-                device,
-                ignore_max_size=False,
-                use_aiter=True,
-                ignore_acr_max_size=ignore_acr_max_size,
-            ),
-        ),
-        ("custom_allreduce_v2", lambda: _open_car_v2(cpu_group, device)),
-        ("nccl", lambda: _open_nccl_allreduce(group, cpu_group, device)),
-        ("torch_symm_mem", lambda: _open_torch_symm_mem(group, cpu_group, device)),
-    ]
-    for quant in qr_quants:
-        openers.append(
-            (
-                f"quick_allreduce_{quant}",
-                lambda quant=quant: _open_quick_allreduce(
-                    quant,
-                    cpu_group,
-                    device,
-                    ignore_min_size=qr_ignore_min_size,
-                    ignore_max_size=qr_ignore_max_size,
-                    cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
-                ),
-            )
-        )
-
-    backends: Dict[str, Any] = {}
-    for name, opener in openers:
+    backends: Dict[str, _Backend] = {}
+    for name, spec in bound.items():
         if verbose:
             print(f"  opening {name}", flush=True)
-        opened = opener()
+        try:
+            opener = _OPENERS[spec["opener"]]
+        except KeyError:
+            raise ValueError(
+                f"{name}: selection opener {spec['opener']!r} has no tuner "
+                "implementation"
+            ) from None
+        params = spec["params"]
+        opened = opener(
+            qualname=params["qualname"],
+            methods=params["methods"],
+            quant_suffix=params["quant_suffix"],
+            quant=params["quant"],
+            lift_cap=params["lift_cap"],
+            cast_bf16_to_fp16=params["cast_bf16_to_fp16"],
+            algorithm=params["algorithm"],
+            cpu_group=params["cpu_group"],
+            device=params["device"],
+        )
         if opened is None:
             if verbose:
                 print(f"  {name}: unavailable", flush=True)
             continue
         backends[name] = opened
         if verbose:
-            impl = getattr(opened[0], "impl", "")
-            note = getattr(opened[0], "note", "")
-            suffix = f" ({impl})" if impl else ""
-            print(f"  {name}: ready{suffix}", flush=True)
-            if note:
-                print(f"  {note}", flush=True)
+            print(f"  {name}: ready", flush=True)
+            if opened.note:
+                print(f"  {opened.note}", flush=True)
     return backends
 
 
-def tune_allreduce(
-    model_config: Dict[str, Any],
-    tp_size: int,
-    group: Optional["torch.distributed.ProcessGroup"] = None,
-    num_iters: int = 100,
-    verbose: bool = True,
-    qr_quants: Optional[List[str]] = None,
-    sizes: Optional[List[int]] = None,
-    qr_ignore_min_size: bool = False,
-    qr_ignore_max_size: bool = False,
-    use_aiter_allreduce: bool = False,
-    qr_cast_bf16_to_fp16: bool = True,
-    use_car_v2: bool = False,
-    ignore_acr_max_size: bool = False,
-    use_median: bool = False,
-) -> Tuple[List[AllreduceConfig], List[Dict[str, Any]]]:
-    """Tune allreduce algorithm for the given model and TP size.
+# ---------------------------------------------------------------------------
+# Tuning loop
+# ---------------------------------------------------------------------------
 
-    Benchmarks each backend for key tensor sizes and returns the
-    best configuration for each size.
+
+def tune_allreduce(
+    sizes: List[int],
+    tp_size: int,
+    mode: str = "eager",
+    group: Optional["ProcessGroup"] = None,
+    num_iters: int = 100,
+    ingraph_calls: int = 10,
+    verbose: bool = True,
+    qr_quant: str = "INT4",
+    ignore_acr_max_size: bool = False,
+    ignore_scr_max_size: bool = False,
+    qr_cast_bf16_to_fp16: bool = True,
+    fly_algorithm: str = "mesh",
+    use_median: bool = False,
+    sync_every: int = _SYNC_EVERY,
+    aiter_dir: str = DEFAULT_AITER_DIR,
+    sglang_dir: str = DEFAULT_SGLANG_DIR,
+    num_warmups: int = DEFAULT_NUM_WARMUP,
+    skip: Sequence[str] = (),
+    scandirs: Sequence[str] = (),
+) -> Tuple[List[AllreduceConfig], List[_Measurement]]:
+    """Time each backend at each size in ``mode`` and return the fastest per size.
+
+    The AITER tree at ``aiter_dir`` and the SGLang tree at ``sglang_dir`` are
+    parsed for their communicator classes, in ``scandirs`` or, when that is
+    empty, in ``DEFAULT_SCAN_DIRS``. A class is timed when this tuner
+    can construct it. HIP QuickReduce and FlyDSL are timed only when
+    ``qr_quant`` is declared in AITER.
     """
     import torch
     import torch.distributed as dist
 
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+    if fly_algorithm not in ("mesh", "ring"):
+        raise ValueError(
+            f"fly_algorithm must be 'mesh' or 'ring', got {fly_algorithm!r}"
+        )
+    if num_warmups < 0:
+        raise ValueError(f"num_warmups must be 0 or more, got {num_warmups}")
     if not dist.is_initialized():
         logger.warning(
-            "torch.distributed is not initialized, so allreduce tuning was skipped. "
-            "Launch one process per GPU with torchrun, for example: "
-            "torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce "
-            "--model-path <model> --tp 8 --qr-quant INT4"
+            "torch.distributed is not initialized, so all-reduce tuning was "
+            "skipped. Launch one process per GPU with torchrun."
         )
-        return []
+        return [], []
 
     if group is None:
         group = dist.group.WORLD
-
+    assert group is not None
     world_size = dist.get_world_size(group)
     if world_size != tp_size:
-        logger.warning(
-            "World size %d != TP size %d; using world size %d",
-            world_size, tp_size, world_size,
-        )
+        logger.warning("World size %d != TP size %d; using %d", world_size, tp_size, world_size)
         tp_size = world_size
 
-    qr_quants = _normalize_qr_quants(qr_quants)
     cpu_group = _cpu_group(group)
     device = torch.device("cuda", torch.cuda.current_device())
-    if sizes is None:
-        sizes = _get_tensor_sizes(model_config)
-    else:
-        sizes = sorted({int(size) for size in sizes})
-    backends = _open_backends(
-        qr_quants,
-        group,
-        cpu_group,
-        device,
-        verbose,
-        qr_ignore_min_size,
-        qr_ignore_max_size=qr_ignore_max_size,
-        use_aiter_allreduce=use_aiter_allreduce,
-        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
-        use_car_v2=use_car_v2,
+    sizes = _normalize_sizes(sizes)
+    scan = scan_aiter(aiter_dir, scandirs)
+    sglang_scan = scan_sglang(sglang_dir, scandirs)
+    plan, skipped, quant_left_out = backend_plan(
+        scan,
+        sglang_scan,
+        qr_quant,
         ignore_acr_max_size=ignore_acr_max_size,
+        ignore_scr_max_size=ignore_scr_max_size,
+        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
+        skip=skip,
     )
     if verbose:
-        print(f"  Backends: {', '.join(backends)}", flush=True)
-        if qr_ignore_min_size or qr_ignore_max_size:
+        print("Scan directories:", flush=True)
+        for entry in scan_dirs(scandirs):
+            print(f"  {entry}", flush=True)
+        print(format_scan(scan, sglang_scan, qr_quant), flush=True)
+        print(f"FlyDSL algorithm: {fly_algorithm}", flush=True)
+        print("Opened from the scan:", flush=True)
+        if plan:
+            for name in plan:
+                print(f"  {name}", flush=True)
+        else:
+            print("  (none)", flush=True)
+        if quant_left_out:
+            print("Left out by quant:", flush=True)
+            for name in quant_left_out:
+                print(f"  {name}", flush=True)
+        if skipped:
+            print("Not opened:", flush=True)
+            for name in skipped:
+                print(f"  {name}", flush=True)
+        unknown = unmatched_skips(
+            [item.qualname for item in (*scan.found, *sglang_scan.found)],
+            skip,
+        )
+        if unknown:
+            print("Skip names matched no scanned class:", flush=True)
+            for name in unknown:
+                print(f"  {name}", flush=True)
+    ready: Dict[str, ReadySpec] = {}
+    for name, spec in plan.items():
+        params = spec["params"]
+        ready[name] = {
+            "opener": spec["opener"],
+            "params": {
+                "qualname": params["qualname"],
+                "methods": params["methods"],
+                "quant_suffix": params["quant_suffix"],
+                "quant": params["quant"],
+                "lift_cap": params["lift_cap"],
+                "cast_bf16_to_fp16": params["cast_bf16_to_fp16"],
+                "cpu_group": cpu_group,
+                "device": device,
+                "algorithm": fly_algorithm,
+            },
+        }
+    backends = _open_backends(ready, verbose)
+    for backend in backends.values():
+        if backend.prepare is not None:
+            backend.prepare(sizes)
+    dtype = torch.bfloat16
+    if verbose:
+        print(
+            "  Backends: "
+            + ", ".join(backend.impl or name for name, backend in backends.items()),
+            flush=True,
+        )
+        print(f"  Mode: {mode}", flush=True)
+        stat = "median" if use_median else "mean"
+        if mode == "graph":
             print(
-                "  Published size caps: not applied. "
-                "A skip is the kernel rejecting the tensor.",
+                f"  Timing: {stat} of {num_iters} replays of a graph with "
+                f"{ingraph_calls} captured calls, per call.",
                 flush=True,
             )
-        cast = int(qr_cast_bf16_to_fp16)
+        else:
+            print(
+                f"  Timing: {stat} of {num_iters} eager calls after "
+                f"{num_warmups} warm-up calls.",
+                flush=True,
+            )
         print(
-            f"  ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16={cast}. "
-            "The bf16 to fp16 cast runs inside the timed QuickReduce kernel.",
+            f"  ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16={int(qr_cast_bf16_to_fp16)}",
             flush=True,
         )
-        print(
-            "  Kernels in this run: sglang custom all-reduce, AITER custom "
-            "all-reduce, and custom all-reduce v2. Each keeps its own size "
-            "cutoff. --ignore-acr-max-size lifts only AITER's.",
-            flush=True,
-        )
-        stat = "median of each call" if use_median else "mean of one timed loop"
-        print(f"  Timing: {stat}, {num_iters} calls after 20 warmup.", flush=True)
-    dtype = model_config.get("dtype", torch.bfloat16)
-    if verbose:
         print(f"  Sizes: {sizes}", flush=True)
 
-    results = []
-    measurements: List[Dict[str, Any]] = []
+    results: List[AllreduceConfig] = []
+    measurements: List[_Measurement] = []
     total_start = time.perf_counter()
+
+    def barrier() -> None:
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
 
     try:
         for idx, size_bytes in enumerate(sizes):
-            num_elements = size_bytes // 2  # bf16/fp16
-            if dtype == torch.float32:
-                num_elements = size_bytes // 4
+            tag = f"  [{idx + 1}/{len(sizes)}] {size_bytes}B"
+            tensor = torch.randn(size_bytes // 2, dtype=dtype, device="cuda")
 
-            if verbose:
-                print(
-                    f"  [{idx + 1}/{len(sizes)}] {size_bytes}B: allocating "
-                    f"{num_elements} x {dtype}",
-                    flush=True,
-                )
-            tensor = torch.randn(num_elements, dtype=dtype, device="cuda")
-
-            best_backend = None
+            best_backend: Optional[str] = None
+            best_method = ""
             best_time = float("inf")
             row_times: Dict[str, Optional[float]] = {}
-
-            for backend_name, (run, _close) in backends.items():
-                if verbose:
-                    print(
-                        f"  [{idx + 1}/{len(sizes)}] {size_bytes}B: "
-                        f"timing {backend_name}",
-                        flush=True,
-                    )
-                # Every rank starts each backend together and finishes it
-                # before any rank moves on.
-                torch.cuda.synchronize()
-                dist.barrier(group=cpu_group)
-                reason = None
-                try:
-                    t = run(tensor, num_iters, use_median=use_median)
-                except Exception as e:
+            for name, backend in backends.items():
+                class_name = backend.impl or name
+                barrier()
+                reason = _check_backend(backend, tensor)
+                # Every rank must agree before any rank enters the collectives.
+                t: Optional[float]
+                if not _agree(reason is None, cpu_group):
+                    reason = reason or "another rank declined the tensor"
                     t = None
-                    reason = str(e).splitlines()[0]
-                torch.cuda.synchronize()
-                dist.barrier(group=cpu_group)
+                else:
+                    try:
+                        t = _time_backend(
+                            backend,
+                            tensor,
+                            mode,
+                            num_iters,
+                            ingraph_calls,
+                            use_median,
+                            barrier,
+                            sync_every,
+                            num_warmups,
+                        )
+                    except _Rejected as e:
+                        t = None
+                        reason = str(e)
+                    except Exception as e:
+                        t = None
+                        reason = _reason_from(e, "timing")
+                barrier()
                 if verbose:
                     shown = f"{t:.2f} us" if t is not None else f"skipped: {reason}"
-                    print(
-                        f"  [{idx + 1}/{len(sizes)}] {size_bytes}B: "
-                        f"{backend_name} -> {shown}",
-                        flush=True,
-                    )
-
-                row_times[backend_name] = t
+                    print(f"{tag}: {class_name} -> {shown}", flush=True)
+                row_times[class_name] = t
                 if t is not None and t < best_time:
-                    best_time = t
-                    best_backend = backend_name
+                    best_time, best_backend, best_method = t, class_name, backend.method
 
-            measurements.append(
-                {"size_bytes": size_bytes, "times_us": row_times}
-            )
+            measurements.append({"size_bytes": size_bytes, "times_us": row_times})
             if best_backend is not None:
-                config = AllreduceConfig(
-                    size_bytes=size_bytes,
-                    backend=best_backend,
-                    time_us=best_time,
-                    tp_size=tp_size,
-                    dtype=str(dtype),
+                results.append(
+                    AllreduceConfig(
+                        size_bytes=size_bytes,
+                        backend=best_backend,
+                        time_us=best_time,
+                        tp_size=tp_size,
+                        dtype=str(dtype),
+                        method=best_method,
+                    )
                 )
-                results.append(config)
                 if verbose:
                     print(
-                        f"  [{idx + 1}/{len(sizes)}] {size_bytes}B: "
-                        f"best {best_backend:20s} {best_time:8.2f} us",
+                        f"{tag}: best {best_backend} {best_time:8.2f} us",
                         flush=True,
                     )
+            del tensor
+            _reclaim_size_cache()
+            barrier()
     finally:
         # Close together: a rank that frees its IPC buffers early can leave a
         # peer still using them.
-        torch.cuda.synchronize()
-        dist.barrier(group=cpu_group)
-        for _run, close in backends.values():
-            if close is not None:
-                close()
+        barrier()
+        for name, backend in backends.items():
+            try:
+                backend.close()
+            except Exception as e:
+                logger.warning(
+                    "closing %s raised %s: %s",
+                    name,
+                    type(e).__name__,
+                    e,
+                )
 
-    total_end = time.perf_counter()
     if verbose:
-        print(f"\n  Allreduce tuning completed in {total_end - total_start:.2f}s")
-        print(f"  Sizes profiled: {len(results)}/{len(sizes)}")
-
+        print(
+            f"\n  All-reduce tuning ({mode}) finished in "
+            f"{time.perf_counter() - total_start:.2f}s, "
+            f"{len(results)}/{len(sizes)} sizes",
+            flush=True,
+        )
     return results, measurements
 
 
 def run_allreduce_tuning(
-    model_config: Dict[str, Any],
+    sizes: List[int],
     tp_size: int,
-    ep_size: int = 1,
-    group: Optional["torch.distributed.ProcessGroup"] = None,
+    mode: str = "eager",
+    group: Optional["ProcessGroup"] = None,
     output_dir: Optional[str] = None,
     verbose: bool = True,
-    qr_quants: Optional[List[str]] = None,
+    qr_quant: str = "INT4",
     num_iters: int = 100,
-    sizes: Optional[List[int]] = None,
-    qr_ignore_min_size: bool = False,
-    qr_ignore_max_size: bool = False,
-    use_aiter_allreduce: bool = False,
-    qr_cast_bf16_to_fp16: bool = True,
-    use_car_v2: bool = False,
+    ingraph_calls: int = 10,
     ignore_acr_max_size: bool = False,
+    ignore_scr_max_size: bool = False,
+    qr_cast_bf16_to_fp16: bool = True,
+    fly_algorithm: str = "mesh",
     use_median: bool = False,
-) -> Dict[str, Any]:
-    """Entry point for allreduce auto-tuning.
-
-    Returns a dict with the best backend for each tensor size,
-    plus a summary of which backend dominates.
-    """
+    sync_every: int = _SYNC_EVERY,
+    aiter_dir: str = DEFAULT_AITER_DIR,
+    sglang_dir: str = DEFAULT_SGLANG_DIR,
+    num_warmups: int = DEFAULT_NUM_WARMUP,
+    skip: Sequence[str] = (),
+    scandirs: Sequence[str] = (),
+) -> AllreduceTuneResult:
+    """Tune, then write ``allreduce_configs_<mode>.json`` into ``output_dir``."""
     if verbose:
-        print(f"\n{'=' * 60}")
-        print("Allreduce Algorithm Tuning")
-        print(f"{'=' * 60}")
-        print(f"  TP: {tp_size}, EP: {ep_size}")
+        print(f"\n{'=' * 60}\nAll-reduce tuning, {mode} mode\n{'=' * 60}")
+        print(f"  TP: {tp_size}")
 
-    qr_quants = _normalize_qr_quants(qr_quants)
     results, measurements = tune_allreduce(
-        model_config,
+        sizes,
         tp_size,
+        mode=mode,
         group=group,
-        verbose=verbose,
-        qr_quants=qr_quants,
         num_iters=num_iters,
-        sizes=sizes,
-        qr_ignore_min_size=qr_ignore_min_size,
-        qr_ignore_max_size=qr_ignore_max_size,
-        use_aiter_allreduce=use_aiter_allreduce,
-        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
-        use_car_v2=use_car_v2,
+        ingraph_calls=ingraph_calls,
+        verbose=verbose,
+        qr_quant=qr_quant,
         ignore_acr_max_size=ignore_acr_max_size,
+        ignore_scr_max_size=ignore_scr_max_size,
+        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
+        fly_algorithm=fly_algorithm,
         use_median=use_median,
+        sync_every=sync_every,
+        aiter_dir=aiter_dir,
+        sglang_dir=sglang_dir,
+        num_warmups=num_warmups,
+        skip=skip,
+        scandirs=scandirs,
     )
-
     if not results:
         if verbose:
-            print("  No results. Skipping.")
+            print("  No results.")
         return {}
 
-    output = {
+    output: AllreduceTuneResult = {
+        "mode": mode,
+        "env": "SGLANG_TUNED_GRAPH_CONFIG" if mode == "graph" else "SGLANG_TUNED_EAGER_CONFIG",
         "tp_size": tp_size,
-        "ep_size": ep_size,
-        "qr_quants": qr_quants,
+        "qr_quant": qr_quant,
         "qr_cast_bf16_to_fp16": int(qr_cast_bf16_to_fp16),
-        "custom_allreduce_impl": "sglang+aiter+v2",
-        "use_car_v2": True,
+        "fly_algorithm": fly_algorithm,
+        "num_warmups": int(num_warmups),
         "ignore_acr_max_size": bool(ignore_acr_max_size),
+        "ignore_scr_max_size": bool(ignore_scr_max_size),
         "num_iters": int(num_iters),
+        "ingraph_calls": int(ingraph_calls) if mode == "graph" else None,
+        "skip": list(skip),
+        "scandirs": list(scan_dirs(scandirs)),
         "timing": "median" if use_median else "mean",
         "configs": [r.to_dict() for r in results],
         "measurements": measurements,
     }
-
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, "allreduce_configs.json")
+        path = os.path.join(output_dir, f"allreduce_configs_{mode}.json")
         with open(path, "w") as f:
             json.dump(output, f, indent=2)
+        output["path"] = path
         if verbose:
             print(f"  Saved to: {path}")
-
     return output
 
 
-def _print_comparison(
-    measurements: List[Dict[str, Any]], timing: str = "mean"
-) -> None:
-    """One row per message size, one column per kernel that was opened."""
-    if not measurements:
-        return
+def _print_comparison(measurements: List[_Measurement], timing: str) -> None:
+    """One row per size, one column per backend. A star marks the fastest."""
     names: List[str] = []
     for row in measurements:
-        for name in row.get("times_us", {}):
+        for name in row["times_us"]:
             if name not in names:
                 names.append(name)
     if not names:
         return
-    width = max(12, *(len(name) for name in names))
+    shown = [f"{source_name(name)} {short_name(name)}" for name in names]
+    width = max(12, *(len(name) for name in shown))
     print(
-        f"\nAllreduce comparison, microseconds ({timing}). "
-        "A star marks the fastest kernel at that size. "
+        f"\nAll-reduce comparison, microseconds per call ({timing}). "
         "skip means the kernel declined the tensor."
     )
-    header = f"{'size':>10}  " + "  ".join(f"{name:<{width}}" for name in names)
+    header = f"{'size':>10}  " + "  ".join(f"{name:<{width}}" for name in shown)
     print(header)
     print("-" * len(header))
     for row in measurements:
-        times = row.get("times_us") or {}
+        times = row["times_us"]
         ranked = [value for value in times.values() if value is not None]
         best = min(ranked) if ranked else None
         cells = []
@@ -871,27 +1315,24 @@ def _print_comparison(
             if value is None:
                 cells.append(f"{'skip':<{width}}")
                 continue
-            text = f"{value:.2f}"
-            if best is not None and value == best:
-                text += "*"
+            text = f"{value:.2f}" + ("*" if value == best else "")
             cells.append(f"{text:<{width}}")
         print(f"{row['size_bytes']:>10}  " + "  ".join(cells))
 
 
-def print_allreduce_summary(results: Dict[str, Any]) -> None:
-    """Print a human-readable summary of allreduce tuning results."""
-    configs = results.get("configs", [])
+def print_allreduce_summary(results: AllreduceTuneResult) -> None:
+    configs = results.get("configs") or []
     if not configs:
-        print("  No allreduce configs to summarize.")
+        print("  No all-reduce configs to summarize.")
         return
-
+    mode = results.get("mode", "eager")
     timing = results.get("timing", "mean")
-    n = results.get("num_iters")
-    count = f", {n} calls" if n else ""
-    print(f"\n{'=' * 60}")
-    print(f"Allreduce Tuning Summary ({timing}{count})")
-    print(f"{'=' * 60}")
+    _print_comparison(results.get("measurements") or [], f"{mode}, {timing}")
+    print(f"\n{'=' * 60}\nAll-reduce tuning summary ({mode}, {timing})\n{'=' * 60}")
     for c in configs:
-        print(f"  {c['size_bytes']:>10}B  {c['backend']:20s}  {c['time_us']:8.2f} us")
-    print(f"{'=' * 60}")
-    _print_comparison(results.get("measurements") or [], timing=timing)
+        print(
+            f"  {c['size_bytes']:>10}B  {c['backend']}  {c['time_us']:8.2f} us"
+        )
+    print("=" * 60)
+    if results.get("path"):
+        print(f"  Use it with {results['env']}={results['path']}")

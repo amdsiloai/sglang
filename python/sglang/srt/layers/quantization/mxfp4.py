@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_xpu,
+    print_warning_once,
     round_up,
     use_intel_amx_backend,
 )
@@ -153,7 +154,12 @@ def _aiter_env_flag(name: str) -> bool:
     get_bool_env_var also accepts "true", which AITER reads as off. Parsing these
     differently makes SGLang pick a weight layout for a route AITER does not run.
     """
-    return os.environ.get(name, "0") == "1"
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        print_warning_once(
+            f"{name}={value!r} is treated as off: AITER only enables it for '1'."
+        )
+    return value == "1"
 
 
 def _aiter_situ_uses_a8w4() -> bool:
@@ -1038,7 +1044,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
-            # K3 SiTU w13 is GU-interleaved; only gfx950's INTERLEAVE reads this layout
+            # A8W4 (gfx950) reads w13 GU-interleaved; tag it so apply() passes INTERLEAVE.
             if is_gfx95_supported() and k3_situ and use_aiter_gu_interleave:
                 layer.situ_gate_up_interleaved = True
 

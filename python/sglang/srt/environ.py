@@ -685,16 +685,11 @@ class Envs:
     # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
-    # Attention (aiter, ROCm): when unified verify is active, drop the host
-    # seq_lens mirror (needs_cpu_seq_lens=False) so spec-v2 overlap resolves
-    # lengths stream-ordered on the GPU instead of syncing the host every step.
-    # Unified verify sizes from its page table and max_context_len. Default off.
-    SGLANG_AITER_SYNC_FREE_VERIFY = EnvBool(False)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
@@ -1091,6 +1086,9 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # gfx950, ROCM_QUICK_REDUCE_QUANTIZATION=INT4: run QuickReduce through aiter's
+    # QuickAllReduce dispatcher (FlyDSL INT4) instead of SGLang's HIP INT4 kernel.
+    SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE = EnvBool(False)
     # gfx950: BF16/FP16 unquantized linears without bias run the vendored tlx.ops.mm
     # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
     SGLANG_USE_TLX_GEMM = EnvBool(False)
@@ -1156,9 +1154,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
-    # Experimental arena reader; see the AITER fixes in the unified-memory docs.
-    # Keep opt-in until the fixed dependency is qualified in the default CI image.
-    SGLANG_ENABLE_AITER_UNIFIED_MEMORY = EnvBool(False)
+    # Try AITER's FlyDSL BF16 unified attention (gfx950, Q/K 192, V 128, page 64
+    # or 128) before its Triton unified attention in the AITER backend.
+    SGLANG_USE_AITER_FLYDSL_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
@@ -1330,6 +1328,10 @@ class Envs:
     # Ascend NPU
     # ===================================================================
     SGLANG_NPU_ENABLE_STATIC_KERNEL = EnvBool(False)
+    # True means an unrotated dense DSpark draft needs correction for a GLM DSA
+    # ModelSlim QuaRot target: use checkpoint-local vocab and fold Q into the FC
+    # weights at load time. False preserves the existing loading behavior.
+    SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
@@ -1561,6 +1563,8 @@ class Envs:
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
@@ -1700,6 +1704,8 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
+    SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
@@ -1805,13 +1811,14 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(_k31_gb_best(32 * 1024, 16 * 1024))
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # All-reduce tune tables written by sglang.auto_tune.run_allreduce. The
+    # eager table picks the kernel for calls that run eagerly; the graph table
+    # picks it for calls recorded into a CUDA graph. Unset keeps the built-in
+    # order for that stage.
+    SGLANG_TUNED_EAGER_CONFIG = EnvStr(None)
+    SGLANG_TUNED_GRAPH_CONFIG = EnvStr(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
-    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
-    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
-    # QuickReduce (and its codec, such as INT4) from the measured message size.
-    # Unset keeps the built-in order.
-    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
@@ -2357,6 +2364,11 @@ class Envs:
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
     SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
     SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
+    # JSON expert placement for Inkling-2 routed experts under expert parallelism:
+    # {"slots": {"<layer_id>": [logical expert held by each physical slot]}};
+    # rank r owns slots [r*E/ep, (r+1)*E/ep). Must be identical on every rank.
+    # Unset keeps contiguous placement.
+    SGLANG_OPT_INKLING2_EXPERT_PLACEMENT_FILE = EnvStr(None)
     # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA
     # serving enables this layout independently of the flag.
     SGLANG_OPT_LINEARIZED_SHARED_SINK = EnvBool(True)

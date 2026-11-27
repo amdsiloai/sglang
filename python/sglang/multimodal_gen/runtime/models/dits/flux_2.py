@@ -747,6 +747,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=self.heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -1001,6 +1002,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
+            global_num_heads=self.heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -1522,6 +1524,7 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     """
 
+    _transposed_linear_weight_archs = ("gfx942",)
     param_names_mapping = {
         # ModelOpt FP8 exports separate Diffusers projections. Merge Q/K/V and
         # their static scales into the runtime MergedColumnParallelLinear.

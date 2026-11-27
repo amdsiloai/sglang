@@ -35,11 +35,6 @@ def main():
         help="Run inference on a multimodal model.",
         add_help=False,
     )
-    subparsers.add_parser(
-        "auto-tune",
-        help="Auto-tune kernel configurations.",
-        add_help=False,
-    )
 
     # simple commands
     subparsers.add_parser(
@@ -57,10 +52,6 @@ def main():
         from sglang.cli.generate import generate
 
         generate(args, extra_argv)
-    elif args.subcommand == "auto-tune":
-        from sglang.auto_tune.main import auto_tune
-
-        auto_tune(args, extra_argv)
     elif args.subcommand == "version":
         version(args, extra_argv)
 

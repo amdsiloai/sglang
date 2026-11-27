@@ -1,19 +1,15 @@
-"""All-reduce tuner. This does not start a server and does not tune MoE.
+"""All-reduce tuner. It does not start a server and does not load a model.
 
-One process cannot all-reduce with itself. torchrun starts one process per
-GPU and sets RANK, LOCAL_RANK, and WORLD_SIZE. QuickReduce is timed at INT4
-unless --qr-quant selects other codecs.
+One process cannot all-reduce with itself, so torchrun starts one process per
+GPU. ``--sizes`` is the message sizes in bytes. Each is timed as a bf16 tensor.
 
     torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
-        --model-path amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 \
-        --tp 8 --qr-quant INT4 --use-aiter-allreduce \
-        --qr-cast-bf16-to-fp16 1 --output-dir /tmp/ar-tune
+        --tp 8 --sizes 16384 32768 --graph 0 --output-dir /tmp/ar-tune
 
---model-path is a Hugging Face id or a local directory that contains
-config.json. The run reads that config and allocates random tensors. It does
-not load the weights. Rank 0 writes allreduce_configs.json.
-
-The server uses that file when SGLANG_ALLREDUCE_TUNE_CONFIG points at it.
+``--graph 0`` (default) times eager calls and writes
+``allreduce_configs_eager.json`` for ``SGLANG_TUNED_EAGER_CONFIG``.
+``--graph 1`` times calls captured into a CUDA graph and writes
+``allreduce_configs_graph.json`` for ``SGLANG_TUNED_GRAPH_CONFIG``.
 """
 
 from __future__ import annotations
@@ -22,82 +18,69 @@ import argparse
 import os
 import sys
 
+from sglang.auto_tune.aiter_comms import (
+    DEFAULT_AITER_DIR,
+    DEFAULT_SCAN_DIRS,
+    DEFAULT_SGLANG_DIR,
+)
 from sglang.auto_tune.allreduce_tuner import (
+    _SYNC_EVERY,
+    DEFAULT_NUM_WARMUP,
     QR_QUANT_REGIMES,
     print_allreduce_summary,
     run_allreduce_tuning,
 )
-from sglang.auto_tune.utils import get_model_config
 
 
-def _optional_bool(value: str) -> bool:
+_STACK_DIR = os.environ.get("ALLREDUCE_TUNE_STACK_DIR", "/tmp/ar-tune-stacks")
+_STACK_PERIOD_S = 20
+
+
+def _bool01(value: str) -> bool:
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "y"}:
         return True
     if text in {"0", "false", "no", "n"}:
         return False
-    raise argparse.ArgumentTypeError("expected true or false")
+    raise argparse.ArgumentTypeError("expected 0 or 1")
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tune all-reduce backends, including QuickReduce INT4."
-    )
-    parser.add_argument(
-        "--model-path",
-        required=True,
-        help="Hugging Face id or a local directory with config.json.",
+        description="Time every all-reduce kernel per message size, eagerly "
+        "or inside a CUDA graph, and write the fastest per size.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \\
+      --tp 8 --qr-quant INT4 --graph 0 --median 1 -n 200 \\
+      --output-dir /tmp/ar-tune \\
+      --sizes 16384 65536 131072
+
+  torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \\
+      --tp 8 --qr-quant INT4 --graph 1 --output-dir /tmp/ar-tune \\
+      --sizes 16384 65536
+""",
     )
     parser.add_argument("--tp", "--tp-size", dest="tp_size", type=int, required=True)
-    parser.add_argument("--ep", "--ep-size", dest="ep_size", type=int, default=1)
     parser.add_argument(
-        "--qr-quant",
-        nargs="+",
-        default=["INT4"],
-        choices=list(QR_QUANT_REGIMES),
-        help="QuickReduce codecs to time. Default is INT4.",
-    )
-    parser.add_argument(
-        "--use-aiter-allreduce",
-        action="store_true",
+        "--graph",
+        type=_bool01,
+        default=False,
         help=(
-            "Accepted for older commands. SGLang custom all-reduce, AITER, "
-            "and custom all-reduce v2 are all timed; this flag does not "
-            "turn the others off."
+            "0 (default): eager calls, for SGLANG_TUNED_EAGER_CONFIG. "
+            "1: calls captured into a CUDA graph inside each communicator's "
+            "capture context and replayed, for SGLANG_TUNED_GRAPH_CONFIG."
         ),
     )
     parser.add_argument(
-        "--use-car-v2",
-        action="store_true",
-        help=(
-            "Accepted for older commands. Custom all-reduce v2 is always "
-            "timed next to SGLang's custom all-reduce and AITER."
-        ),
-    )
-    parser.add_argument(
-        "--ignore-acr-max-size",
-        action="store_true",
-        help=(
-            "Ignore AITER_CUSTOM_AR_MAX_SIZE and time AITER up to its "
-            "registered pool. SGLang custom all-reduce and v2 keep their "
-            "own cutoffs. The server keeps its own cutoff."
-        ),
-    )
-    parser.add_argument(
-        "--qr-cast-bf16-to-fp16",
+        "--ingraph-calls",
         type=int,
-        choices=(0, 1),
-        default=1,
+        default=10,
         help=(
-            "Value of ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16, set before "
-            "QuickReduce is built. 1, the server default, casts bf16 to fp16 "
-            "inside the timed QuickReduce kernel. 0 times the bf16 kernels."
+            "Graph mode: all-reduces captured back to back in one graph. "
+            "The time is per call. Default 10."
         ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="allreduce_tune_out",
-        help="Rank 0 writes allreduce_configs.json here.",
     )
     parser.add_argument(
         "-n",
@@ -106,76 +89,182 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=100,
         help=(
-            "Timed calls per kernel and size. Warmup calls are extra and "
-            "are not counted. Default is 100."
+            "Timed calls per kernel and size in eager mode, timed graph "
+            "replays in graph mode. Warm-up is extra. Default 100."
         ),
     )
     parser.add_argument(
         "--median",
-        nargs="?",
-        const=True,
+        type=_bool01,
         default=False,
-        type=_optional_bool,
         help=(
-            "Pick the winner from the median of the timed calls. "
-            "--median and --median true turn it on. Without it, the "
-            "winner is the mean of one timed loop."
+            "1: winner from the median of per-call (eager) or per-replay "
+            "(graph) times. 0 (default): mean of one timed loop."
         ),
     )
     parser.add_argument(
         "--sizes",
         nargs="+",
         type=int,
-        default=None,
+        required=True,
+        help="Message sizes in bytes. Each is timed as a bf16 tensor.",
+    )
+    parser.add_argument(
+        "--aiter-dir",
+        default=DEFAULT_AITER_DIR,
         help=(
-            "Message sizes in bytes, replacing the sizes derived from the "
-            "model. A bf16 tensor of shape [num_tokens, hidden] is "
-            "num_tokens * hidden * 2 bytes."
+            "AITER source tree to parse for communicator classes and "
+            f"quantizations. Default {DEFAULT_AITER_DIR}."
         ),
     )
     parser.add_argument(
-        "--qr-ignore-min-size",
-        action="store_true",
+        "--sglang-dir",
+        default=DEFAULT_SGLANG_DIR,
         help=(
-            "Time QuickReduce below the codec's minimum message size. "
-            "The server keeps the minimum."
+            "Directory that contains the sglang package. Its device "
+            f"communicators are parsed and logged. Default {DEFAULT_SGLANG_DIR}."
         ),
     )
     parser.add_argument(
-        "--ignore-scr-size-bounds",
-        dest="ignore_scr_size_bounds",
-        action="store_true",
+        "--qr-quant",
+        default="INT4",
+        choices=list(QR_QUANT_REGIMES),
         help=(
-            "Do not apply the published QuickReduce or custom all-reduce size "
-            "caps. A size is skipped only when the kernel rejects the tensor, "
-            "and the rejection is printed. The server keeps its own bounds."
+            "HIP QuickReduce and FlyDSL codec. Default INT4. A row is "
+            "opened only when the scan declares this quant."
+        ),
+    )
+    parser.add_argument(
+        "--qr-cast-bf16-to-fp16",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help=(
+            "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16 for HIP QuickReduce. 1 (the "
+            "server default) casts inside the timed kernel."
+        ),
+    )
+    parser.add_argument(
+        "--scandir",
+        nargs="+",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Directories or files to parse for communicator classes. A "
+            "relative path is taken under --aiter-dir or --sglang-dir, "
+            "whichever has it; an absolute path must be inside one of them. "
+            "'*' is allowed. Give it to replace the defaults, so list the "
+            "SGLang directory too if it should still be scanned. Repeat the "
+            "flag, or pass several paths after one --scandir. Default: "
+            + ", ".join(DEFAULT_SCAN_DIRS)
+            + "."
+        ),
+    )
+    parser.add_argument(
+        "--num-warmups",
+        type=int,
+        default=DEFAULT_NUM_WARMUP,
+        help=(
+            "Untimed calls (eager) or replays (graph) before each timed loop, "
+            f"so kernels and workspaces are built first. Default {DEFAULT_NUM_WARMUP}. "
+            "0 times from the first call."
+        ),
+    )
+    parser.add_argument(
+        "--fly-algorithm",
+        default="mesh",
+        choices=("mesh", "ring"),
+        help=(
+            "FlyQuickAllReduce schedule, also applied to QuickAllReduceInt4. "
+            "AITER registers two. mesh (default): each rank pushes to all "
+            "N-1 peers on both the reduce-scatter and the all-gather, two "
+            "hops, the xGMI schedule, and QuickAllReduceInt4's own default. "
+            "ring: 2(N-1) hops, each a single write to one neighbor, the "
+            "PCIe schedule."
+        ),
+    )
+    parser.add_argument(
+        "--skip",
+        nargs="+",
+        action="append",
+        default=[],
+        metavar="CLASS",
+        help=(
+            "Communicators to leave out of the timing. Each value is a full "
+            "class name, for example "
+            "aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4, or "
+            "the class name alone. Use it when a class is obsolete on this "
+            "AITER pin, or when its accuracy is not acceptable. Repeat the "
+            "flag, or pass several names after one --skip."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-acr-max-size",
+        type=_bool01,
+        default=False,
+        help=(
+            "1: time AITER past AITER_CUSTOM_AR_MAX_SIZE, up to half its "
+            "registered pool. The server runs such a row the same way."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-scr-max-size",
+        type=_bool01,
+        default=False,
+        help=(
+            "1: time SGLang's custom all-reduce past its max size, up to "
+            "its buffer. The server runs such a row the same way."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="allreduce_tune_out",
+        help="Rank 0 writes allreduce_configs_<eager|graph>.json here.",
+    )
+    parser.add_argument(
+        "--sync-every",
+        type=int,
+        default=_SYNC_EVERY,
+        help=(
+            "Barrier across ranks every this many timed calls (eager) or "
+            f"replays (graph). Default {_SYNC_EVERY}. 0 never barriers inside "
+            "the loop, which is what hangs: the kernels spin-wait on their "
+            "peers, so the ranks must not drift far apart."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        dest="stack_period_s",
+        type=float,
+        default=_STACK_PERIOD_S,
+        help=(
+            "Seconds of no progress before every rank's stack is dumped, "
+            f"repeating. Default {_STACK_PERIOD_S}. 0 turns the dumps off. "
+            "Raise it when a size legitimately takes longer than this, so "
+            "the dumps do not bury the results."
         ),
     )
     return parser
 
 
-_STACK_DIR = os.environ.get("ALLREDUCE_TUNE_STACK_DIR", "/tmp/ar-tune-stacks")
-_STACK_PERIOD_S = 20
-
-
-def _enable_stack_dumps(rank: int) -> None:
+def _enable_stack_dumps(rank: int, period_s: float = _STACK_PERIOD_S) -> None:
     """Print every rank's stack into this terminal while the run is hung.
 
-    Each rank records its own stack. Rank 0 reprints the latest dump from
-    every rank on stderr, which torchrun shows in the same shell. A rank
-    inside torch.cuda.synchronize is waiting on a kernel. A rank inside
-    broadcast_object_list or barrier is waiting on a peer.
+    A rank inside torch.cuda.synchronize is waiting on a kernel. A rank inside
+    broadcast_object_list or barrier is waiting on a peer. ``period_s`` is how
+    long a rank may make no progress before it dumps; 0 turns the dumps off.
     """
     import faulthandler
     import threading
 
-    os.makedirs(_STACK_DIR, exist_ok=True)
-    path = os.path.join(_STACK_DIR, f"rank{rank}.txt")
-    stream = open(path, "w")
-    faulthandler.enable(file=stream, all_threads=True)
-    faulthandler.dump_traceback_later(_STACK_PERIOD_S, repeat=True, file=stream)
-    stream.flush()
+    if period_s <= 0:
+        return
 
+    os.makedirs(_STACK_DIR, exist_ok=True)
+    stream = open(os.path.join(_STACK_DIR, f"rank{rank}.txt"), "w")
+    faulthandler.enable(file=stream, all_threads=True)
+    faulthandler.dump_traceback_later(period_s, repeat=True, file=stream)
     if rank != 0:
         return
 
@@ -184,36 +273,37 @@ def _enable_stack_dumps(rank: int) -> None:
     def _report() -> None:
         import time
 
-        time.sleep(_STACK_PERIOD_S + 5)
+        time.sleep(period_s + 5)
         while True:
             parts = ["\n===== where each rank is ====="]
             for other in range(world_size):
-                other_path = os.path.join(_STACK_DIR, f"rank{other}.txt")
                 try:
-                    with open(other_path) as handle:
-                        lines = handle.readlines()
+                    with open(os.path.join(_STACK_DIR, f"rank{other}.txt")) as fh:
+                        lines = fh.readlines()
                 except OSError:
                     lines = []
                 tail = "".join(lines[-8:]).rstrip() or "(no dump yet)"
                 parts.append(f"--- rank {other} ---\n{tail}")
             print("\n".join(parts), file=sys.stderr, flush=True)
-            time.sleep(_STACK_PERIOD_S)
+            time.sleep(period_s)
 
     threading.Thread(target=_report, name="stack-report", daemon=True).start()
 
 
-def _init_distributed() -> None:
+def _init_distributed(stack_period_s: float = _STACK_PERIOD_S) -> None:
     import torch
     import torch.distributed as dist
 
     if "LOCAL_RANK" not in os.environ:
         sys.exit(
-            "All-reduce tuning needs one process per GPU.\n"
+            "All-reduce tuning needs one process per GPU:\n"
             "torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce "
-            "--model-path <model> --tp 8 --qr-quant INT4"
+            "--tp 8 --sizes <bytes>..."
         )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    _enable_stack_dumps(int(os.environ.get("RANK", os.environ["LOCAL_RANK"])))
+    _enable_stack_dumps(
+        int(os.environ.get("RANK", os.environ["LOCAL_RANK"])), stack_period_s
+    )
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
@@ -222,39 +312,50 @@ def main(argv: list[str] | None = None) -> None:
     args = create_parser().parse_args(argv)
     if args.num_iters < 1:
         sys.exit("-n must be at least 1")
-    _init_distributed()
+    if args.ingraph_calls < 1:
+        sys.exit("--ingraph-calls must be at least 1")
+    if args.sync_every < 0:
+        sys.exit("--sync-every must be 0 or more")
+    if args.num_warmups < 0:
+        sys.exit("--num-warmups must be 0 or more")
+    if any(size <= 0 or size % 2 for size in args.sizes):
+        sys.exit("--sizes must be positive multiples of 2 bytes (bf16 tensors)")
+    _init_distributed(args.stack_period_s)
 
     import torch.distributed as dist
 
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
     try:
-        if args.tp_size != world_size:
+        if args.tp_size != dist.get_world_size():
             if rank == 0:
                 print(
                     f"--tp {args.tp_size} does not match the torchrun world "
-                    f"size {world_size}. Use --nproc_per_node={args.tp_size}.",
+                    f"size {dist.get_world_size()}. Use "
+                    f"--nproc_per_node={args.tp_size}.",
                     file=sys.stderr,
                 )
             sys.exit(1)
 
-        model_config = get_model_config(args.model_path, args.tp_size, args.ep_size)
         results = run_allreduce_tuning(
-            model_config,
+            args.sizes,
             tp_size=args.tp_size,
-            ep_size=args.ep_size,
+            mode="graph" if args.graph else "eager",
             output_dir=args.output_dir if rank == 0 else None,
             verbose=(rank == 0),
-            qr_quants=args.qr_quant,
+            qr_quant=args.qr_quant,
             num_iters=args.num_iters,
-            sizes=args.sizes,
-            qr_ignore_min_size=args.qr_ignore_min_size or args.ignore_scr_size_bounds,
-            qr_ignore_max_size=args.ignore_scr_size_bounds,
-            use_aiter_allreduce=args.use_aiter_allreduce,
-            qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
-            use_car_v2=args.use_car_v2,
+            ingraph_calls=args.ingraph_calls,
             ignore_acr_max_size=args.ignore_acr_max_size,
-            use_median=bool(args.median),
+            ignore_scr_max_size=args.ignore_scr_max_size,
+            qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
+            fly_algorithm=args.fly_algorithm,
+            num_warmups=args.num_warmups,
+            use_median=args.median,
+            sync_every=args.sync_every,
+            aiter_dir=args.aiter_dir,
+            sglang_dir=args.sglang_dir,
+            skip=tuple(name for group in args.skip for name in group),
+            scandirs=tuple(path for group in args.scandir for path in group),
         )
         if rank == 0:
             print_allreduce_summary(results)

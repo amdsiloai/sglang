@@ -1,1 +1,1 @@
-# Import submodules directly. Importing this package must not load the MoE tuner.
+# Import submodules directly: python -m sglang.auto_tune.run_allreduce

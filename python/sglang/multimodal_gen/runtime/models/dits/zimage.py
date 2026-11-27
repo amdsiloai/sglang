@@ -414,6 +414,7 @@ class ZImageAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
@@ -893,6 +894,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     block_cls = ZImageTransformerBlock
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
+    _transposed_linear_weight_archs = ("gfx942",)
     param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = (
         ZImageDitConfig().arch_config.reverse_param_names_mapping
